@@ -43,7 +43,17 @@ def get_pull_requests(repo, after_cursor=None):
     '''
     variables = {'owner': ORG_NAME, 'repo': repo, 'cursor': after_cursor}
     response = requests.post('https://api.github.com/graphql', headers=headers, json={'query': query, 'variables': variables})
-    return response.json()
+    
+    if response.status_code != 200:
+        print(f'Error {response.status_code}: {response.text}')
+        return None
+    
+    response_json = response.json()
+    if 'errors' in response_json:
+        print(f'GraphQL errors: {response_json["errors"]}')
+        return None
+    
+    return response_json
 
 # Function to audit a specific repository
 def audit_repository(repo):
@@ -51,11 +61,20 @@ def audit_repository(repo):
     pr_cursor = None
     while True:
         pr_data = get_pull_requests(repo, pr_cursor)
-        pull_requests = pr_data['data']['repository']['pullRequests']['nodes']
-        pr_page_info = pr_data['data']['repository']['pullRequests']['pageInfo']
+        if pr_data is None:
+            print('Failed to retrieve pull request data.')
+            break
+        
+        repository = pr_data.get('data', {}).get('repository', {})
+        if not repository:
+            print('No repository data found in response.')
+            break
+        
+        pull_requests = repository.get('pullRequests', {}).get('nodes', [])
+        pr_page_info = repository.get('pullRequests', {}).get('pageInfo', {})
         
         for pr in pull_requests:
-            for file in pr['files']['nodes']:
+            for file in pr.get('files', {}).get('nodes', []):
                 if file['path'].startswith('.checkmarx/') and file['path'].endswith('application.yml'):
                     audit_log.append({
                         'repository': repo,
@@ -68,13 +87,16 @@ def audit_repository(repo):
                         'deletions': file['deletions']
                     })
         
-        if not pr_page_info['hasNextPage']:
+        if not pr_page_info.get('hasNextPage'):
             break
-        pr_cursor = pr_page_info['endCursor']
+        pr_cursor = pr_page_info.get('endCursor')
     
     with open(AUDIT_LOG, 'w') as log_file:
         json.dump(audit_log, log_file, indent=4)
 
 if __name__ == '__main__':
-    audit_repository(REPO_NAME)
-    print(f'Audit completed for {REPO_NAME}. Check {AUDIT_LOG} for details.')
+    try:
+        audit_repository(REPO_NAME)
+        print(f'Audit completed for {REPO_NAME}. Check {AUDIT_LOG} for details.')
+    except Exception as e:
+        print(f'An error occurred: {e}')
