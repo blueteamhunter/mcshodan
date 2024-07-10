@@ -74,7 +74,9 @@ def audit_repository(repo):
         pr_page_info = repository.get('pullRequests', {}).get('pageInfo', {})
         
         for pr in pull_requests:
+            print(f'Checking PR #{pr["number"]}: {pr["title"]}')
             for file in pr.get('files', {}).get('nodes', []):
+                print(f'  - Found file: {file["path"]}')
                 if file['path'].startswith('.checkmarx/') and file['path'].endswith('application.yml'):
                     audit_log.append({
                         'repository': repo,
@@ -91,12 +93,16 @@ def audit_repository(repo):
             break
         pr_cursor = pr_page_info.get('endCursor')
     
-    with open(AUDIT_LOG, 'w') as log_file:
-        json.dump(audit_log, log_file, indent=4)
+    if not audit_log:
+        print('No matching pull requests found.')
+    else:
+        with open(AUDIT_LOG, 'w') as log_file:
+            json.dump(audit_log, log_file, indent=4)
+        print(f'Audit log written to {AUDIT_LOG}')
 
 if __name__ == '__main__':
     try:
         audit_repository(REPO_NAME)
-        print(f'Audit completed for {REPO_NAME}. Check {AUDIT_LOG} for details.')
+        print(f'Audit completed for {REPO_NAME}.')
     except Exception as e:
         print(f'An error occurred: {e}')
