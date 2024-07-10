@@ -3,40 +3,47 @@ import requests
 # Configuration
 GITHUB_TOKEN = 'your_generated_github_token'
 ORG_NAME = 'your_organization_name'
-REPO_NAME = 'your_test_repository'  # Enter the repository you want to test
-AUDIT_LOG = 'audit_log_test.txt'
+REPO_NAME = 'your_test_repository'  # For testing purposes, specify a single repository
 SEARCH_FILE = '.checkmarx/application.yml'
+AUDIT_LOG = 'audit_log_test.txt'
 
 headers = {
     'Authorization': f'token {GITHUB_TOKEN}',
     'Accept': 'application/vnd.github.v3+json'
 }
 
-# Function to audit changes to application.yml in a repository
-def audit_repository(repo):
-    repo_url = f'https://api.github.com/repos/{ORG_NAME}/{repo}/commits'
+# Function to get the commit history of a repository
+def get_commit_history(repo):
+    url = f'https://api.github.com/repos/{ORG_NAME}/{repo}/commits'
     params = {'path': SEARCH_FILE, 'per_page': 100}
-    repo_audit_log = []
+    commits = []
 
-    while repo_url:
-        response = requests.get(repo_url, headers=headers, params=params)
+    while url:
+        response = requests.get(url, headers=headers, params=params)
         if response.status_code == 200:
-            commits = response.json()
-            for commit in commits:
-                commit_details = requests.get(commit['url'], headers=headers).json()
-                for file in commit_details.get('files', []):
-                    if file['filename'] == SEARCH_FILE and 'previous_filename' in file:
-                        repo_audit_log.append({
-                            'repo': repo,
-                            'commit': commit['sha'],
-                            'author': commit['commit']['author']['name'],
-                            'date': commit['commit']['author']['date'],
-                            'previous_filename': file['previous_filename']
-                        })
-            repo_url = response.links.get('next', {}).get('url')
+            commits.extend(response.json())
+            url = response.links.get('next', {}).get('url')
         else:
             print(f'Error: {response.status_code} - {response.text}')
             break
+    
+    return commits
+
+# Function to parse commit details for changes to application.yml
+def parse_commit_details(repo, commits):
+    repo_audit_log = []
+
+    for commit in commits:
+        commit_details = requests.get(commit['url'], headers=headers).json()
+        for file in commit_details.get('files', []):
+            if file['filename'] == SEARCH_FILE and 'previous_filename' in file:
+                repo_audit_log.append({
+                    'repo': repo,
+                    'commit': commit['sha'],
+                    'author': commit['commit']['author']['name'],
+                    'date': commit['commit']['author']['date'],
+                    'previous_filename': file['previous_filename']
+                })
     
     return repo_audit_log
 
@@ -53,6 +60,7 @@ def write_audit_log(results):
 
 # Main execution
 if __name__ == '__main__':
-    results = audit_repository(REPO_NAME)
+    commits = get_commit_history(REPO_NAME)
+    results = parse_commit_details(REPO_NAME, commits)
     write_audit_log(results)
     print(f'Audit completed for {REPO_NAME}. Check {AUDIT_LOG} for details.')
