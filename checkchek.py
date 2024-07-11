@@ -20,6 +20,7 @@ def get_repositories():
         print(f"Status Code: {response.status_code}")
         if response.status_code == 200:
             repos = response.json()
+            print(f"Response JSON: {repos}")  # Print the entire JSON response for debugging
             for repo in repos:
                 REPOS.append(repo['name'])
             # Check if there's another page of results
