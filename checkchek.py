@@ -16,6 +16,7 @@ headers = {
 
 # Function to get all repositories in the organization
 def get_repositories():
+    global REPOS
     url = f'https://api.github.com/orgs/{ORG_NAME}/repos?per_page=100'
     while url:
         response = requests.get(url, headers=headers)
@@ -29,7 +30,7 @@ def get_repositories():
             else:
                 url = None
         else:
-            print(f'Failed to fetch repositories: {response.status_code}')
+            print(f'Failed to fetch repositories: {response.status_code} - {response.text}')
             break
 
 # Function to audit changes to files in .checkmarx directory in a repository
@@ -81,7 +82,7 @@ if __name__ == '__main__':
         print(f"Existing audit log {AUDIT_LOG} removed.")
 
     get_repositories()
-    print(f"Found {len(REPOS)} repositories")
+    print(f"Found {len(REPOS)} repositories: {REPOS}")
 
     for repo in REPOS:
         audit_repository(repo)
