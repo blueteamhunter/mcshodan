@@ -1,6 +1,6 @@
 import requests
-import subprocess
 import os
+import subprocess
 
 # Configuration
 GITHUB_TOKEN = 'your_github_token'
@@ -8,48 +8,47 @@ ORG_NAME = 'your_organization_name'
 REPO_NAMES = ['repo1', 'repo2', 'repo3']  # List of repositories to audit
 AUDIT_LOG = '/tmp/audit_log_test.txt'  # Use an absolute path to avoid any relative path issues
 
-headers = {
-    'Authorization': f'token {GITHUB_TOKEN}',
-    'Accept': 'application/vnd.github.v3+json'
-}
-
-# Function to get pull requests for a repository
-def get_pull_requests(repo):
-    url = f'https://api.github.com/repos/{ORG_NAME}/{repo}/pulls?state=all&per_page=100'
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f'Failed to fetch pull requests for {repo}: {response.status_code}')
-        return []
-
-# Function to get files changed in a pull request
-def get_pull_request_files(repo, pr_number):
-    url = f'https://api.github.com/repos/{ORG_NAME}/{repo}/pulls/{pr_number}/files'
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f'Failed to fetch files for PR #{pr_number} in {repo}: {response.status_code}')
-        return []
-
 # Function to audit changes to files in .checkmarx directory in a repository
 def audit_repository(repo):
-    prs = get_pull_requests(repo)
-    for pr in prs:
-        files = get_pull_request_files(repo, pr['number'])
-        for file in files:
-            if file['filename'].startswith('.checkmarx/'):
-                try:
-                    with open(AUDIT_LOG, 'a') as log_file:
-                        log_file.write(f'Repository: {repo}\n')
-                        log_file.write(f'Pull Request: #{pr["number"]} - {pr["title"]}\n')
-                        log_file.write(f'Author: {pr["user"]["login"]}\n')
-                        log_file.write(f'Date: {pr["created_at"]}\n')
-                        log_file.write(f'File: {file["filename"]} (Additions: {file["additions"]}, Deletions: {file["deletions"]})\n')
-                        log_file.write('\n')
-                except Exception as e:
-                    print(f"Failed to write to log file {AUDIT_LOG}: {e}")
+    repo_dir = f'/tmp/{repo}'
+    if os.path.exists(repo_dir):
+        subprocess.run(['rm', '-rf', repo_dir])
+    clone_result = subprocess.run(['git', 'clone', f'https://github.com/{ORG_NAME}/{repo}.git', repo_dir])
+    
+    if clone_result.returncode != 0:
+        print(f"Failed to clone repository {repo}")
+        return
+    
+    os.chdir(repo_dir)
+    
+    # Logging the current directory for debugging
+    print(f"Changed directory to {repo_dir}")
+
+    # Check for changes in the .checkmarx directory
+    result = subprocess.run(['git', 'log', '--pretty=format:%H %an %ad %s', '--date=iso', '--', '.checkmarx/'], capture_output=True, text=True)
+    changes = result.stdout.strip().split('\n')
+    
+    if result.returncode != 0:
+        print(f"Failed to get git log for repository {repo}")
+        return
+    
+    # Logging the changes for debugging
+    print(f"Found changes: {changes}")
+
+    if changes and changes != ['']:
+        try:
+            with open(AUDIT_LOG, 'a') as log_file:
+                log_file.write(f'Changes in {repo}:\n')
+                for change in changes:
+                    log_file.write(f'{change}\n')
+                log_file.write('\n')
+            print(f"Changes written to {AUDIT_LOG}")
+        except Exception as e:
+            print(f"Failed to write to log file {AUDIT_LOG}: {e}")
+    else:
+        print(f"No changes found in {repo} for .checkmarx directory")
+    
+    os.chdir('/tmp')
 
 # Main execution
 if __name__ == '__main__':
