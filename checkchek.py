@@ -9,14 +9,14 @@ ORG_NAME = 'your_organization_name'
 REPO_NAME = 'your_test_repository'  # Specify the repository name for testing
 AUDIT_LOG = 'audit_log.txt'
 
-# Function to audit changes to application.xml in a repository
+# Function to audit changes to files in .checkmarx directory in a repository
 def audit_repository(repo):
     repo_dir = f'/tmp/{repo}'
     if os.path.exists(repo_dir):
         subprocess.run(['rm', '-rf', repo_dir])
     subprocess.run(['git', 'clone', f'https://github.com/{ORG_NAME}/{repo}.git', repo_dir])
     os.chdir(repo_dir)
-    result = subprocess.run(['git', 'log', '--pretty=format:%H %an %ad', '--date=iso', '--', '.checkmarx/application.xml'], capture_output=True, text=True)
+    result = subprocess.run(['git', 'log', '--pretty=format:%H %an %ad', '--date=iso', '--', '.checkmarx/'], capture_output=True, text=True)
     changes = result.stdout.strip().split('\n')
     if changes:
         with open(AUDIT_LOG, 'a') as log_file:
