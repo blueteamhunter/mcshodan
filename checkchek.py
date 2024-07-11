@@ -6,20 +6,8 @@ import os
 # Configuration
 GITHUB_TOKEN = 'your_github_token'
 ORG_NAME = 'your_organization_name'
-REPOS = []  # List to hold repository names
+REPO_NAME = 'your_test_repository'  # Specify the repository name for testing
 AUDIT_LOG = 'audit_log.txt'
-
-# Function to get all repositories in the organization
-def get_repositories():
-    url = f'https://api.github.com/orgs/{ORG_NAME}/repos'
-    headers = {'Authorization': f'token {GITHUB_TOKEN}'}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        repos = response.json()
-        for repo in repos:
-            REPOS.append(repo['name'])
-    else:
-        print(f'Failed to fetch repositories: {response.status_code}')
 
 # Function to audit changes to application.xml in a repository
 def audit_repository(repo):
@@ -40,7 +28,5 @@ def audit_repository(repo):
 
 # Main execution
 if __name__ == '__main__':
-    get_repositories()
-    for repo in REPOS:
-        audit_repository(repo)
-    print(f'Audit completed. Check {AUDIT_LOG} for details.')
+    audit_repository(REPO_NAME)
+    print(f'Audit completed for {REPO_NAME}. Check {AUDIT_LOG} for details.')
