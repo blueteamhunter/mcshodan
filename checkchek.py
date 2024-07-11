@@ -6,8 +6,31 @@ import os
 # Configuration
 GITHUB_TOKEN = 'your_github_token'
 ORG_NAME = 'your_organization_name'
-REPO_NAME = 'your_test_repository'  # Specify the repository name for testing
-AUDIT_LOG = 'audit_log_test.txt'
+AUDIT_LOG = '/tmp/audit_log.txt'  # Use an absolute path to avoid any relative path issues
+REPOS = []  # List to hold repository names
+
+headers = {
+    'Authorization': f'token {GITHUB_TOKEN}',
+    'Accept': 'application/vnd.github.v3+json'
+}
+
+# Function to get all repositories in the organization
+def get_repositories():
+    url = f'https://api.github.com/orgs/{ORG_NAME}/repos?per_page=100'
+    while url:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            repos = response.json()
+            for repo in repos:
+                REPOS.append(repo['name'])
+            # Check if there's another page of results
+            if 'next' in response.links:
+                url = response.links['next']['url']
+            else:
+                url = None
+        else:
+            print(f'Failed to fetch repositories: {response.status_code}')
+            break
 
 # Function to audit changes to files in .checkmarx directory in a repository
 def audit_repository(repo):
@@ -36,12 +59,16 @@ def audit_repository(repo):
     # Logging the changes for debugging
     print(f"Found changes: {changes}")
 
-    if changes:
-        with open(AUDIT_LOG, 'a') as log_file:
-            log_file.write(f'Changes in {repo}:\n')
-            for change in changes:
-                log_file.write(f'{change}\n')
-            log_file.write('\n')
+    if changes and changes != ['']:
+        try:
+            with open(AUDIT_LOG, 'a') as log_file:
+                log_file.write(f'Changes in {repo}:\n')
+                for change in changes:
+                    log_file.write(f'{change}\n')
+                log_file.write('\n')
+            print(f"Changes written to {AUDIT_LOG}")
+        except Exception as e:
+            print(f"Failed to write to log file {AUDIT_LOG}: {e}")
     else:
         print(f"No changes found in {repo} for .checkmarx directory")
     
@@ -49,5 +76,17 @@ def audit_repository(repo):
 
 # Main execution
 if __name__ == '__main__':
-    audit_repository(REPO_NAME)
-    print(f'Audit completed for {REPO_NAME}. Check {AUDIT_LOG} for details.')
+    if os.path.exists(AUDIT_LOG):
+        os.remove(AUDIT_LOG)
+        print(f"Existing audit log {AUDIT_LOG} removed.")
+
+    get_repositories()
+    print(f"Found {len(REPOS)} repositories")
+
+    for repo in REPOS:
+        audit_repository(repo)
+    
+    if os.path.exists(AUDIT_LOG):
+        print(f'Audit completed. Check {AUDIT_LOG} for details.')
+    else:
+        print(f"Audit log {AUDIT_LOG} was not created.")
