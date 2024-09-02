@@ -1,55 +1,24 @@
-import boto3
+import json
 
-def list_hosted_zones():
-    """List all hosted zones in Route 53."""
-    client = boto3.client('route53')
-    response = client.list_hosted_zones()
-    hosted_zones = response['HostedZones']
-    
-    return hosted_zones
+def read_and_sum_disk_usage(filename):
+    total_disk_usage = 0
 
-def list_dns_records(hosted_zone_id):
-    """List all DNS records in a given hosted zone."""
-    client = boto3.client('route53')
-    paginator = client.get_paginator('list_resource_record_sets')
-    records = []
-    
-    for page in paginator.paginate(HostedZoneId=hosted_zone_id):
-        records.extend(page['ResourceRecordSets'])
-    
-    return records
+    # Open the file containing the output of the GitHub CLI command
+    with open(filename, 'r') as file:
+        # Read each line of the file
+        for line in file:
+            # Parse each line as JSON
+            try:
+                repo_data = json.loads(line.strip())
+                # Add the disk usage value to the total
+                total_disk_usage += repo_data.get('diskUsage', 0)
+            except json.JSONDecodeError:
+                print("Error decoding JSON from the line:", line)
 
-def validate_dns_record(record):
-    """Validate a DNS record for security best practices."""
-    if record['Type'] == 'A':
-        # Example: Check for public IPs in internal zones
-        for r in record['ResourceRecords']:
-            ip = r['Value']
-            if ip.startswith('192.') or ip.startswith('10.'):
-                print(f"Potential misconfiguration: {record['Name']} points to private IP.")
-    
-    if record['Type'] == 'CNAME':
-        # Check for unwanted redirections
-        if record['ResourceRecords'][0]['Value'].endswith('.internal'):
-            print(f"Misconfiguration: {record['Name']} points to internal CNAME.")
-    
-    # Example: Detect wildcard records
-    if record['Name'].startswith('*'):
-        print(f"Warning: Wildcard record detected -> {record['Name']}")
-    
-    # Add more validation rules as needed
+    return total_disk_usage
 
-def sanitize_dns_entries():
-    """Sanitize DNS entries in all hosted zones."""
-    hosted_zones = list_hosted_zones()
-    
-    for zone in hosted_zones:
-        print(f"Checking zone: {zone['Name']}")
-        records = list_dns_records(zone['Id'])
-        
-        for record in records:
-            validate_dns_record(record)
-            # Add logic to remove or fix the record if needed
-
+# Usage example
 if __name__ == "__main__":
-    sanitize_dns_entries()
+    filename = 'gh_output.txt'  # Replace with your actual filename
+    total_kilobytes = read_and_sum_disk_usage(filename)
+    print("Total Disk Usage: {} Kilobytes".format(total_kilobytes))
