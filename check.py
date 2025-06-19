@@ -1,27 +1,91 @@
-import json
+import requests
 
-def read_and_sum_disk_usage(filename):
-    total_disk_usage = 0
+# === CONFIGURATION ===
+API_TOKEN = 'YOUR_CLOUDFLARE_API_TOKEN'
+ZONE_ID = 'YOUR_CLOUDFLARE_ZONE_ID'
 
-    # Open the file containing the output of the GitHub CLI command
-    with open(filename, 'r') as file:
-        # Read the entire file content
-        content = file.read()
+CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4'
+
+HEADERS = {
+    'Authorization': f'Bearer {API_TOKEN}',
+    'Content-Type': 'application/json'
+}
+
+def get_dns_records(zone_id):
+    url = f'{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records'
+    records = []
+    page = 1
+    per_page = 100
+
+    while True:
+        params = {
+            'page': page,
+            'per_page': per_page
+        }
+        resp = requests.get(url, headers=HEADERS, params=params)
+        data = resp.json()
+        if not data.get('success'):
+            raise Exception(f"API error: {data}")
+
+        records.extend(data['result'])
+
+        if page * per_page >= data['result_info']['total_count']:
+            break
+        page += 1
+    
+    return records
+
+def is_ip_public(ip):
+    import ipaddress
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local)
+    except ValueError:
+        return False
+
+def analyze_records(records):
+    vulnerable = []
+
+    for record in records:
+        proxied = record.get('proxied', False)
+        r_type = record.get('type')
+        content = record.get('content')
+        name = record.get('name')
+
+        if r_type in ['A', 'AAAA']:
+            if not proxied and is_ip_public(content):
+                vulnerable.append({
+                    'name': name,
+                    'type': r_type,
+                    'content': content,
+                    'reason': 'Unproxied public IP'
+                })
         
-        # Parse the JSON data
-        try:
-            repos = json.loads(content)
-            # Iterate over each repository entry
-            for repo in repos:
-                # Add the disk usage value to the total
-                total_disk_usage += repo.get('diskUsage', 0)
-        except json.JSONDecodeError:
-            print("Error decoding JSON from the file")
+        elif r_type == 'CNAME':
+            if not proxied:
+                vulnerable.append({
+                    'name': name,
+                    'type': r_type,
+                    'content': content,
+                    'reason': 'Unproxied CNAME (check if origin)'
+                })
 
-    return total_disk_usage
+    return vulnerable
 
-# Usage example
-if __name__ == "__main__":
-    filename = 'gh_output.txt'  # Replace with your actual filename
-    total_kilobytes = read_and_sum_disk_usage(filename)
-    print("Total Disk Usage: {} Kilobytes".format(total_kilobytes))
+def main():
+    print("Fetching DNS records...")
+    records = get_dns_records(ZONE_ID)
+    print(f"Found {len(records)} records.")
+
+    print("Analyzing records for DTO vulnerability...")
+    vulnerable_records = analyze_records(records)
+
+    if not vulnerable_records:
+        print("✅ No DTO vulnerabilities detected — all records proxied or safe!")
+    else:
+        print("⚠️ Potential DTO vulnerable records:")
+        for v in vulnerable_records:
+            print(f" - {v['name']} ({v['type']} -> {v['content']}): {v['reason']}")
+
+if __name__ == '__main__':
+    main()
