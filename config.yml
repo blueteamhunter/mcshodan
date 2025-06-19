@@ -1,0 +1,7 @@
+api_token: YOUR_CLOUDFLARE_API_TOKEN
+zones:
+  - 
+  - 
+  # Add more zone IDs
+threads: 10
+output_csv: dto_check_results.csv
