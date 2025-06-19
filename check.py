@@ -1,9 +1,13 @@
 import requests
 import socket
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIGURATION ===
 API_TOKEN = 'YOUR_CLOUDFLARE_API_TOKEN'
 ZONE_ID = 'YOUR_CLOUDFLARE_ZONE_ID'
+THREADS = 10
+OUTPUT_CSV = 'dto_check_results.csv'
 
 CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4'
 
@@ -42,7 +46,7 @@ def try_direct_connection(target, use_https=True):
         url = f"{scheme}://{target}"
         resp = requests.get(url, timeout=5)
         return resp.status_code
-    except Exception as e:
+    except Exception:
         return None
 
 def resolve_cname_target(target):
@@ -51,62 +55,71 @@ def resolve_cname_target(target):
     except Exception:
         return None
 
-def analyze_records(records):
-    results = []
+def test_origin(record):
+    proxied = record.get('proxied', False)
+    r_type = record.get('type')
+    content = record.get('content')
+    name = record.get('name')
 
-    for record in records:
-        proxied = record.get('proxied', False)
-        r_type = record.get('type')
-        content = record.get('content')
-        name = record.get('name')
+    if not proxied or r_type not in ['CNAME', 'A', 'AAAA']:
+        return None  # Skip non-proxied or irrelevant records
 
-        # Only check if it's proxied (meaning origin hidden via Cloudflare)
-        if proxied and r_type in ['CNAME', 'A', 'AAAA']:
-            print(f"Testing origin for {name} ({r_type} -> {content}) ...")
+    print(f"Testing origin for {name} ({r_type} -> {content}) ...")
 
-            target = content
+    target = content
 
-            if r_type == 'CNAME':
-                ip = resolve_cname_target(content)
-                print(f" - Resolved {content} to {ip}")
-            else:
-                ip = content
+    if r_type == 'CNAME':
+        ip = resolve_cname_target(content)
+    else:
+        ip = content
 
-            # Try HTTPS first
-            status_code = try_direct_connection(content, use_https=True)
-            if not status_code:
-                # Try HTTP fallback
-                status_code = try_direct_connection(content, use_https=False)
+    # Try HTTPS first
+    status_code = try_direct_connection(content, use_https=True)
+    if not status_code:
+        # Try HTTP fallback
+        status_code = try_direct_connection(content, use_https=False)
 
-            if status_code:
-                results.append({
-                    'record': name,
-                    'origin': content,
-                    'resolved_ip': ip,
-                    'status': status_code,
-                    'message': '⚠️ Origin responded directly — possible DTO'
-                })
-            else:
-                results.append({
-                    'record': name,
-                    'origin': content,
-                    'resolved_ip': ip,
-                    'status': 'No response',
-                    'message': '✅ Origin did not respond directly'
-                })
-    
-    return results
+    if status_code:
+        message = '⚠️ Origin responded directly — possible DTO'
+    else:
+        message = '✅ Origin did not respond directly'
+
+    return {
+        'record': name,
+        'type': r_type,
+        'origin': content,
+        'resolved_ip': ip,
+        'status': status_code or 'No response',
+        'message': message
+    }
+
+def export_results_csv(results, filename):
+    fieldnames = ['record', 'type', 'origin', 'resolved_ip', 'status', 'message']
+    with open(filename, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            if r:
+                writer.writerow(r)
+    print(f"✅ Results exported to {filename}")
 
 def main():
     print("Fetching DNS records...")
     records = get_dns_records(ZONE_ID)
     print(f"Found {len(records)} records.")
 
-    print("Testing origins for DTO vulnerability...")
-    results = analyze_records(records)
+    print(f"Testing origins for DTO vulnerability using {THREADS} threads...")
 
-    for r in results:
-        print(f"{r['record']} -> {r['origin']} ({r['resolved_ip']}) | {r['status']} | {r['message']}")
+    results = []
+    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+        futures = [executor.submit(test_origin, r) for r in records]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                print(f"{result['record']} -> {result['origin']} | {result['status']} | {result['message']}")
+                results.append(result)
+
+    export_results_csv(results, OUTPUT_CSV)
 
 if __name__ == '__main__':
     main()
