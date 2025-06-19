@@ -1,4 +1,5 @@
 import requests
+import socket
 
 # === CONFIGURATION ===
 API_TOKEN = 'YOUR_CLOUDFLARE_API_TOKEN'
@@ -35,16 +36,23 @@ def get_dns_records(zone_id):
     
     return records
 
-def is_ip_public(ip):
-    import ipaddress
+def try_direct_connection(target, use_https=True):
     try:
-        ip_obj = ipaddress.ip_address(ip)
-        return not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local)
-    except ValueError:
-        return False
+        scheme = 'https' if use_https else 'http'
+        url = f"{scheme}://{target}"
+        resp = requests.get(url, timeout=5)
+        return resp.status_code
+    except Exception as e:
+        return None
+
+def resolve_cname_target(target):
+    try:
+        return socket.gethostbyname(target)
+    except Exception:
+        return None
 
 def analyze_records(records):
-    vulnerable = []
+    results = []
 
     for record in records:
         proxied = record.get('proxied', False)
@@ -52,40 +60,53 @@ def analyze_records(records):
         content = record.get('content')
         name = record.get('name')
 
-        if r_type in ['A', 'AAAA']:
-            if not proxied and is_ip_public(content):
-                vulnerable.append({
-                    'name': name,
-                    'type': r_type,
-                    'content': content,
-                    'reason': 'Unproxied public IP'
-                })
-        
-        elif r_type == 'CNAME':
-            if not proxied:
-                vulnerable.append({
-                    'name': name,
-                    'type': r_type,
-                    'content': content,
-                    'reason': 'Unproxied CNAME (check if origin)'
-                })
+        # Only check if it's proxied (meaning origin hidden via Cloudflare)
+        if proxied and r_type in ['CNAME', 'A', 'AAAA']:
+            print(f"Testing origin for {name} ({r_type} -> {content}) ...")
 
-    return vulnerable
+            target = content
+
+            if r_type == 'CNAME':
+                ip = resolve_cname_target(content)
+                print(f" - Resolved {content} to {ip}")
+            else:
+                ip = content
+
+            # Try HTTPS first
+            status_code = try_direct_connection(content, use_https=True)
+            if not status_code:
+                # Try HTTP fallback
+                status_code = try_direct_connection(content, use_https=False)
+
+            if status_code:
+                results.append({
+                    'record': name,
+                    'origin': content,
+                    'resolved_ip': ip,
+                    'status': status_code,
+                    'message': '⚠️ Origin responded directly — possible DTO'
+                })
+            else:
+                results.append({
+                    'record': name,
+                    'origin': content,
+                    'resolved_ip': ip,
+                    'status': 'No response',
+                    'message': '✅ Origin did not respond directly'
+                })
+    
+    return results
 
 def main():
     print("Fetching DNS records...")
     records = get_dns_records(ZONE_ID)
     print(f"Found {len(records)} records.")
 
-    print("Analyzing records for DTO vulnerability...")
-    vulnerable_records = analyze_records(records)
+    print("Testing origins for DTO vulnerability...")
+    results = analyze_records(records)
 
-    if not vulnerable_records:
-        print("✅ No DTO vulnerabilities detected — all records proxied or safe!")
-    else:
-        print("⚠️ Potential DTO vulnerable records:")
-        for v in vulnerable_records:
-            print(f" - {v['name']} ({v['type']} -> {v['content']}): {v['reason']}")
+    for r in results:
+        print(f"{r['record']} -> {r['origin']} ({r['resolved_ip']}) | {r['status']} | {r['message']}")
 
 if __name__ == '__main__':
     main()
