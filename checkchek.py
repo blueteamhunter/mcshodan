@@ -1,57 +1,91 @@
 import requests
 
-# Configuration
-GITHUB_TOKEN = 'your_github_token'
-ORG_NAME = 'your_organization_name'
-REPOS = []  # List to hold repository names
+# === CONFIGURATION ===
+API_TOKEN = 'YOUR_CLOUDFLARE_API_TOKEN'
+ZONE_ID = 'YOUR_CLOUDFLARE_ZONE_ID'
 
-headers = {
-    'Authorization': f'Bearer {GITHUB_TOKEN}',
+CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4'
+
+HEADERS = {
+    'Authorization': f'Bearer {API_TOKEN}',
     'Content-Type': 'application/json'
 }
 
-# GraphQL query to get repositories
-def get_repositories(after_cursor=None):
-    query = '''
-    query($org: String!, $cursor: String) {
-      organization(login: $org) {
-        repositories(first: 100, after: $cursor) {
-          nodes {
-            name
-          }
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-        }
-      }
-    }
-    '''
-    variables = {'org': ORG_NAME, 'cursor': after_cursor}
-    response = requests.post('https://api.github.com/graphql', headers=headers, json={'query': query, 'variables': variables})
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f'Error: {response.status_code} - {response.text}')
-        return None
+def get_dns_records(zone_id):
+    url = f'{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records'
+    records = []
+    page = 1
+    per_page = 100
 
-# Main execution to fetch and print all repository names
-if __name__ == '__main__':
-    after_cursor = None
     while True:
-        repo_data = get_repositories(after_cursor)
-        if repo_data is None:
-            print('Failed to retrieve repository data.')
+        params = {
+            'page': page,
+            'per_page': per_page
+        }
+        resp = requests.get(url, headers=HEADERS, params=params)
+        data = resp.json()
+        if not data.get('success'):
+            raise Exception(f"API error: {data}")
+
+        records.extend(data['result'])
+
+        if page * per_page >= data['result_info']['total_count']:
             break
-        
-        repositories = repo_data.get('data', {}).get('organization', {}).get('repositories', {}).get('nodes', [])
-        page_info = repo_data.get('data', {}).get('organization', {}).get('repositories', {}).get('pageInfo', {})
-        
-        for repo in repositories:
-            REPOS.append(repo['name'])
-        
-        if not page_info.get('hasNextPage'):
-            break
-        after_cursor = page_info.get('endCursor')
+        page += 1
     
-    print(f"Found {len(REPOS)} repositories: {REPOS}")
+    return records
+
+def is_ip_public(ip):
+    import ipaddress
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local)
+    except ValueError:
+        return False
+
+def analyze_records(records):
+    vulnerable = []
+
+    for record in records:
+        proxied = record.get('proxied', False)
+        r_type = record.get('type')
+        content = record.get('content')
+        name = record.get('name')
+
+        if r_type in ['A', 'AAAA']:
+            if not proxied and is_ip_public(content):
+                vulnerable.append({
+                    'name': name,
+                    'type': r_type,
+                    'content': content,
+                    'reason': 'Unproxied public IP'
+                })
+        
+        elif r_type == 'CNAME':
+            if not proxied:
+                vulnerable.append({
+                    'name': name,
+                    'type': r_type,
+                    'content': content,
+                    'reason': 'Unproxied CNAME (check if origin)'
+                })
+
+    return vulnerable
+
+def main():
+    print("Fetching DNS records...")
+    records = get_dns_records(ZONE_ID)
+    print(f"Found {len(records)} records.")
+
+    print("Analyzing records for DTO vulnerability...")
+    vulnerable_records = analyze_records(records)
+
+    if not vulnerable_records:
+        print("✅ No DTO vulnerabilities detected — all records proxied or safe!")
+    else:
+        print("⚠️ Potential DTO vulnerable records:")
+        for v in vulnerable_records:
+            print(f" - {v['name']} ({v['type']} -> {v['content']}): {v['reason']}")
+
+if __name__ == '__main__':
+    main()
