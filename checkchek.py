@@ -1,56 +1,120 @@
-Here’s a minimal Lambda to test the whole Route 53 crawl and one-Excel-per-zone export — no email, no S3. It assumes the cross-account roles, lists all zones and all records, writes .xlsx per zone to /tmp, and returns a concise summary you can see in the test result & CloudWatch Logs.
+awesome — let’s stand up the test Lambda from scratch in Account A, using CLI on your WSL Ubuntu. This version is read-only and doesn’t send email or use S3. It assumes roles into Accounts B & C, lists all hosted zones and all records, and writes one Excel per zone to /tmp. You’ll see a JSON summary on invoke + details in CloudWatch Logs.
 
-1) What this test Lambda does
+0) Set your region & IDs (shell vars)
+export AWS_REGION=us-east-1          # pick your region for Lambda
+export ACCOUNT_A_ID=111111111111     # tooling account (Lambda lives here)
+export ACCOUNT_B_ID=222222222222     # target
+export ACCOUNT_C_ID=333333333333     # target
 
-Assumes roles into Accounts B & C (from TARGET_ROLE_ARNS).
+1) (Recap) Target roles in B & C (if not already done)
 
-For each hosted zone, fetches all record sets (paginated).
+Create Route53ReadExport role in B and C:
 
-Writes one Excel workbook per zone to /tmp.
+Trust (trusts Account A’s Lambda role; you can fill this later once you know the role ARN)
+For now you can temporarily trust Account A root (easier while bootstrapping), then tighten to the role ARN later:
 
-Returns a JSON summary: per-account zones, record counts, and a sample of the first few records and generated file paths.
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:root" },
+      "Action": "sts:AssumeRole" }
+  ]
+}
 
-No SES/SNS/S3 — pure functional test of logic & Excel generation.
 
-2) Prereqs & config
+Permissions (read-only Route53):
 
-IAM (unchanged from earlier):
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["route53:ListHostedZones","route53:ListResourceRecordSets"],
+      "Resource": "*" }
+  ]
+}
 
-Account A – Lambda execution role
 
-Trust policy: lambda.amazonaws.com
+After you create the Lambda role (next step), tighten trust to the role ARN (least privilege). I show that change below.
 
-Inline perms: CloudWatch Logs; sts:AssumeRole → arn:aws:iam::ACCOUNT_B_ID:role/Route53ReadExport, ...ACCOUNT_C_ID...
+2) Create the Lambda execution role (Account A)
+2.1 Trust policy (Lambda service)
 
-Accounts B & C – Route53ReadExport role
+Save as trust-lambda.json:
 
-Trust: arn:aws:iam::ACCOUNT_A_ID:role/r53-exporter-lambda-role (optionally require ExternalId)
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "LambdaTrust", "Effect": "Allow",
+      "Principal": { "Service": "lambda.amazonaws.com" },
+      "Action": "sts:AssumeRole" }
+  ]
+}
 
-Perms: route53:ListHostedZones, route53:ListResourceRecordSets
 
-Lambda settings
+Create role:
 
-Runtime: Python 3.12
+aws iam create-role \
+  --role-name r53-exporter-lambda-role \
+  --assume-role-policy-document file://trust-lambda.json
 
-Memory: 512–1024 MB
 
-Timeout: 5–10 min
+Attach basic logs (managed policy):
 
-Layer: openpyxl (build as before)
+aws iam attach-role-policy \
+  --role-name r53-exporter-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-Environment variables:
+2.2 Inline permissions (allow AssumeRole into B & C)
 
-TARGET_ROLE_ARNS = arn:aws:iam::ACCOUNT_B_ID:role/Route53ReadExport,arn:aws:iam::ACCOUNT_C_ID:role/Route53ReadExport
+Save as lambda-inline-perms.json (replace IDs if needed):
 
-WRITE_EXCEL = true # set false to dry-run without writing files
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "AssumeTargets", "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::222222222222:role/Route53ReadExport",
+        "arn:aws:iam::333333333333:role/Route53ReadExport"
+      ] }
+  ]
+}
 
-MAX_PATHS_IN_OUTPUT = 25 # cap number of file paths returned
 
-SAMPLE_RECORDS_PER_ZONE = 3 # number of sample records to return per zone in output
+Attach:
 
-EXTERNAL_ID = (optional; only if B/C trust requires it)
+aws iam put-role-policy \
+  --role-name r53-exporter-lambda-role \
+  --policy-name r53-exporter-assume-targets \
+  --policy-document file://lambda-inline-perms.json
 
-3) Lambda code (paste as lambda_function.py)
+
+Get the role ARN (you’ll need it to tighten B/C trust later):
+
+aws iam get-role --role-name r53-exporter-lambda-role \
+  --query 'Role.Arn' --output text
+
+
+Example: arn:aws:iam::111111111111:role/r53-exporter-lambda-role
+
+3) Attach the openpyxl layer
+
+(You already built/published the layer in WSL earlier. If not, I can re-send those steps.)
+
+Grab its LayerVersionArn, e.g.:
+
+arn:aws:lambda:us-east-1:111111111111:layer:openpyxl-3_1_5:1
+
+4) Create the function package
+
+Create a working folder and drop in the test Lambda:
+
+mkdir -p ~/lambda/route53-exporter-test && cd ~/lambda/route53-exporter-test
+
+
+Create lambda_function.py with this read-only test code:
+
 import os, time, datetime, logging, re
 import boto3
 from botocore.config import Config
@@ -60,10 +124,9 @@ from openpyxl.utils import get_column_letter
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
-ROUTE53_REGION = "us-east-1"  # Route 53 is global; us-east-1 is fine for client
+ROUTE53_REGION = "us-east-1"
 TMP_DIR = "/tmp"
 
-# ---------- helpers ----------
 def _env(name, default=None, required=False):
     v = os.environ.get(name, default)
     if required and (v is None or v == ""):
@@ -141,7 +204,6 @@ def write_zone_workbook(account_id: str, zone_name: str, zone_id: str, records: 
         ]
         ws.append(row)
 
-    # Autosize (bounded)
     for col_idx, _ in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
         col_letter = get_column_letter(col_idx)
         max_len = 0
@@ -157,9 +219,7 @@ def write_zone_workbook(account_id: str, zone_name: str, zone_id: str, records: 
     wb.save(out_path)
     return out_path
 
-# ---------- handler ----------
 def lambda_handler(event, context):
-    # env
     role_arns = [a.strip() for a in _env("TARGET_ROLE_ARNS", required=True).split(",") if a.strip()]
     write_excel = _env("WRITE_EXCEL", "true").lower() == "true"
     max_paths = int(_env("MAX_PATHS_IN_OUTPUT", "25"))
@@ -168,7 +228,7 @@ def lambda_handler(event, context):
     summary = {
         "run_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ"),
         "accounts": [],
-        "generated_files": [],  # capped for response
+        "generated_files": [],
     }
 
     total_zone_count = 0
@@ -197,14 +257,12 @@ def lambda_handler(event, context):
             acct_zone_count += 1
             acct_record_count += len(records)
 
-            # write workbook per zone (if enabled)
             path = None
             if write_excel:
                 path = write_zone_workbook(account_id, zone_name or zone_id, zone_id, records)
                 all_paths.append(path)
                 log.info(f"[{account_id}] wrote {path} ({len(records)} records)")
 
-            # sample a few records for quick inspection
             sample = []
             for rr in records[:sample_records_per_zone]:
                 sample.append({
@@ -229,7 +287,6 @@ def lambda_handler(event, context):
         acct_detail["total_records"] = acct_record_count
         summary["accounts"].append(acct_detail)
 
-    # Cap the file path list in the response
     summary["totals"] = {"zones": total_zone_count, "records": total_record_count}
     summary["generated_files"] = all_paths[:max_paths]
     if len(all_paths) > max_paths:
@@ -237,36 +294,89 @@ def lambda_handler(event, context):
 
     return summary
 
-4) How to test
 
-A) Quick console test
+Zip it:
 
-In Lambda → Test → create a test event (any JSON, e.g. {}).
+zip -j function.zip lambda_function.py
 
-Run.
+5) Create the Lambda function
 
-Check:
+Get your Lambda role ARN:
 
-Return value (JSON) shows per-account totals, zone samples, and a list of file paths written under /tmp.
+LAMBDA_ROLE_ARN=$(aws iam get-role --role-name r53-exporter-lambda-role \
+  --query 'Role.Arn' --output text)
+echo $LAMBDA_ROLE_ARN
 
-CloudWatch Logs show lines like:
-wrote /tmp/route53-123456789012-example_com-20251007T150012Z.xlsx (42 records)
 
-B) AWS CLI test (from your machine)
+Create the function:
+
+aws lambda create-function \
+  --function-name route53-exporter-test \
+  --runtime python3.12 \
+  --role "$LAMBDA_ROLE_ARN" \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://function.zip \
+  --region $AWS_REGION
+
+
+Attach the openpyxl layer:
+
+aws lambda update-function-configuration \
+  --function-name route53-exporter-test \
+  --layers arn:aws:lambda:$AWS_REGION:$ACCOUNT_A_ID:layer:openpyxl-3_1_5:1 \
+  --region $AWS_REGION
+
+
+Set environment variables:
+
+aws lambda update-function-configuration \
+  --function-name route53-exporter-test \
+  --environment "Variables={\
+TARGET_ROLE_ARNS=arn:aws:iam::$ACCOUNT_B_ID:role/Route53ReadExport,arn:aws:iam::$ACCOUNT_C_ID:role/Route53ReadExport,\
+WRITE_EXCEL=true,MAX_PATHS_IN_OUTPUT=25,SAMPLE_RECORDS_PER_ZONE=3}" \
+  --timeout 600 \
+  --memory-size 1024 \
+  --region $AWS_REGION
+
+
+(If B/C trust requires ExternalId, add EXTERNAL_ID=your-id above.)
+
+6) Tighten B/C trust to the role ARN (least privilege)
+
+Now update B and C trust policies to only trust your role:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "TrustAccountARoleOnly", "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:role/r53-exporter-lambda-role" },
+      "Action": "sts:AssumeRole"
+      /* , "Condition": { "StringEquals": { "sts:ExternalId": "YOUR_EXTERNAL_ID" } } */
+    }
+  ]
+}
+
+7) Test invoke & logs
+
+Invoke:
 
 aws lambda invoke \
   --function-name route53-exporter-test \
   --payload '{}' \
   --cli-binary-format raw-in-base64-out \
-  out.json && cat out.json | jq
+  out.json --region $AWS_REGION && cat out.json | jq
 
 
-Note: /tmp is ephemeral inside the Lambda container and not directly retrievable. This test is meant to verify logic, pagination, counts, and file creation. When you’re satisfied, re-enable your SES flow (or add S3) to actually receive the files.
+Tail logs:
 
-5) Common tweaks
+aws logs tail "/aws/lambda/route53-exporter-test" --follow --region $AWS_REGION
 
-Set WRITE_EXCEL=false to validate speed and pagination first (no files written).
 
-Increase timeout if you have many zones/records.
+You should see log lines like:
 
-If B/C trust uses ExternalId, set EXTERNAL_ID env var — the code already supports it.
+[222222222222] hosted zones: 7
+[222222222222] wrote /tmp/route53-222222222222-example_com-20251007T...Z.xlsx (42 records)
+
+That’s it
+
+Once you’re happy with the output (counts, files written to /tmp), you can switch to the SES version to deliver the per-zone Excel files via email. If you want, I can also generate a one-shot script that runs every command above for you with your real IDs.
