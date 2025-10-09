@@ -1,16 +1,26 @@
-✅ Fix Option 2 (use JSON file — clean and reusable)
+Got you. If the Lambda is still touching every account, it means one of these is true:
 
-This method avoids shell quoting completely.
+the old code (that uses Organizations) is still deployed;
 
-cat > env.json <<EOF
+the env var ALLOWED_ACCOUNT_IDS didn’t make it to the Lambda (empty at runtime);
+
+IAM still allows organizations:ListAccounts and the code path fell back to it.
+
+Let’s fix this in three layers so it can’t go wrong: (A) verify env & code, (B) add a tiny “force-allowlist” safeguard, (C) harden IAM so it’s physically impossible to enumerate or assume outside B & C.
+
+A) Verify your env var is actually set on the Lambda + push the correct code
+
+Set ALLOWED_ACCOUNT_IDS (use JSON file to avoid shell issues):
+
+cat > env.json <<'EOF'
 {
   "Variables": {
-    "ORG_ROLE_NAME": "$ORG_ROLE_NAME",
-    "REPORT_BUCKET": "$BUCKET",
-    "REPORT_PREFIX": "$REPORT_PREFIX",
-    "SNS_TOPIC_ARN": "$SNS_TOPIC_ARN",
-    "PRESIGN_TTL_SEC": "$PRESIGN_TTL_SEC",
-    "ALLOWED_ACCOUNT_IDS": "111111111111,222222222222"
+    "ORG_ROLE_NAME": "'"$ORG_ROLE_NAME"'",
+    "REPORT_BUCKET": "'"$BUCKET"'",
+    "REPORT_PREFIX": "'"$REPORT_PREFIX"'",
+    "SNS_TOPIC_ARN": "'"$SNS_TOPIC_ARN"'",
+    "PRESIGN_TTL_SEC": "'"$PRESIGN_TTL_SEC"'",
+    "ALLOWED_ACCOUNT_IDS": "<B_ID>,<C_ID>"
   }
 }
 EOF
@@ -18,18 +28,151 @@ EOF
 aws lambda update-function-configuration \
   --function-name "$FUNC_NAME" \
   --environment file://env.json \
-  --timeout 900 \
-  --memory-size 512 \
+  --timeout 900 --memory-size 512 \
   --region "$REGION"
 
 
-✅ This is the recommended DevOps way — stable, readable, and reproducible in CI/CD.
-
-🧪 Verify it worked
-
-Check the environment variables set in AWS:
+Confirm on AWS:
 
 aws lambda get-function-configuration \
   --function-name "$FUNC_NAME" \
   --region "$REGION" \
   --query 'Environment.Variables' --output table
+
+
+Ensure ALLOWED_ACCOUNT_IDS shows the two comma-separated IDs (no spaces).
+
+Make sure the new code (with get_target_accounts() and allowlist logic) is live:
+
+rm -f function.zip
+zip -r function.zip lambda_function.py
+aws lambda update-function-code \
+  --function-name "$FUNC_NAME" \
+  --zip-file fileb://function.zip \
+  --region "$REGION"
+
+
+Invoke & check logs. You should see “Using ALLOWED_ACCOUNT_IDS…”:
+
+aws lambda invoke --function-name "$FUNC_NAME" --payload '{}' --region "$REGION" out.json && cat out.json
+aws logs tail "/aws/lambda/$FUNC_NAME" --follow --since 15m --region "$REGION"
+
+
+Expected log line:
+
+Using ALLOWED_ACCOUNT_IDS: <B_ID>,<C_ID>
+Targeting 2 account(s): <B_ID>,<C_ID>
+
+
+If you don’t see that line, you’re still on old code. Re-zip and re-push.
+
+B) Add a tiny safeguard so it NEVER falls back to Organizations
+
+Add this 2-line feature flag to the top config and a guard in get_target_accounts().
+
+Patch snippet (add to your existing file)
+# top config (with the other env reads)
+FORCE_ALLOWED_ONLY = os.environ.get("FORCE_ALLOWED_ONLY", "true").lower() == "true"
+ALLOWED_ACCOUNTS  = [a.strip() for a in os.environ.get("ALLOWED_ACCOUNT_IDS", "").split(",") if a.strip()]
+
+
+Replace your get_target_accounts() with this stricter version:
+
+def get_target_accounts() -> List[Dict]:
+    """
+    Returns a list of dicts [{Id:<acctId>, Name:<label>}, ...]
+    If ALLOWED_ACCOUNT_IDS is set, only those accounts are used (Name=Id).
+    If not set and FORCE_ALLOWED_ONLY is true, we fail fast (no org discovery).
+    Otherwise, we fall back to Organizations list (ACTIVE accounts).
+    """
+    if ALLOWED_ACCOUNTS:
+        logger.info("Using ALLOWED_ACCOUNT_IDS: %s", ",".join(ALLOWED_ACCOUNTS))
+        return [{"Id": aid, "Name": aid} for aid in ALLOWED_ACCOUNTS]
+
+    if FORCE_ALLOWED_ONLY:
+        raise RuntimeError("ALLOWED_ACCOUNT_IDS is empty and FORCE_ALLOWED_ONLY=true. "
+                           "Set ALLOWED_ACCOUNT_IDS to a comma-separated list of account IDs.")
+
+    # fallback (only if FORCE_ALLOWED_ONLY is false)
+    ORG = boto3.client("organizations")
+    out, token = [], None
+    while True:
+        kwargs = {}
+        if token: kwargs["NextToken"] = token
+        resp = _backoff_call(ORG.list_accounts, **kwargs)
+        out.extend(a for a in resp["Accounts"] if a["Status"] == "ACTIVE")
+        token = resp.get("NextToken")
+        if not token: break
+    return out
+
+
+Then deploy and set the flag:
+
+rm -f function.zip
+zip -r function.zip lambda_function.py
+aws lambda update-function-code --function-name "$FUNC_NAME" --zip-file fileb://function.zip --region "$REGION"
+
+aws lambda update-function-configuration \
+  --function-name "$FUNC_NAME" \
+  --environment "Variables={\
+ORG_ROLE_NAME=$ORG_ROLE_NAME,\
+REPORT_BUCKET=$BUCKET,\
+REPORT_PREFIX=$REPORT_PREFIX,\
+SNS_TOPIC_ARN=$SNS_TOPIC_ARN,\
+PRESIGN_TTL_SEC=$PRESIGN_TTL_SEC,\
+ALLOWED_ACCOUNT_IDS=$(< env.json jq -r '.Variables.ALLOWED_ACCOUNT_IDS'),\
+FORCE_ALLOWED_ONLY=true}" \
+  --timeout 900 --memory-size 512 \
+  --region "$REGION"
+
+
+Re-invoke and tail logs—you should never see it listing all accounts again. If ALLOWED_ACCOUNT_IDS is missing, it raises and stops.
+
+C) Defense-in-depth: harden IAM so it physically can’t touch others
+
+Even if someone changes code/env later, restrict the role to only B & C:
+
+cat > only-two-accounts.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::<B_ID>:role/$ORG_ROLE_NAME",
+        "arn:aws:iam::<C_ID>:role/$ORG_ROLE_NAME"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject","s3:GetObject","s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::$BUCKET",
+        "arn:aws:s3:::$BUCKET/*"
+      ]
+    },
+    { "Effect": "Allow", "Action": ["sns:Publish"], "Resource": "$SNS_TOPIC_ARN" },
+    { "Effect": "Allow", "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"], "Resource": "*" }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name route53-monthly-export-inline \
+  --policy-document file://only-two-accounts.json
+
+
+(Optionally remove organizations:ListAccounts permission entirely since you won’t use it.)
+
+Quick sanity checklist
+
+aws lambda get-function-configuration ... | grep ALLOWED_ACCOUNT_IDS → shows your two IDs
+
+CloudWatch log shows:
+Using ALLOWED_ACCOUNT_IDS: … and Targeting 2 account(s): …
+
+No organizations:ListAccounts calls appear in logs anymore
+
+IAM inline policy’s sts:AssumeRole has only the two ARNs
