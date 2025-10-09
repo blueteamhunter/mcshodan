@@ -1,15 +1,35 @@
-export ALLOWED_ACCOUNT_IDS="111111111111,222222222222"
+✅ Fix Option 2 (use JSON file — clean and reusable)
+
+This method avoids shell quoting completely.
+
+cat > env.json <<EOF
+{
+  "Variables": {
+    "ORG_ROLE_NAME": "$ORG_ROLE_NAME",
+    "REPORT_BUCKET": "$BUCKET",
+    "REPORT_PREFIX": "$REPORT_PREFIX",
+    "SNS_TOPIC_ARN": "$SNS_TOPIC_ARN",
+    "PRESIGN_TTL_SEC": "$PRESIGN_TTL_SEC",
+    "ALLOWED_ACCOUNT_IDS": "111111111111,222222222222"
+  }
+}
+EOF
 
 aws lambda update-function-configuration \
   --function-name "$FUNC_NAME" \
-  --environment 'Variables={
-ORG_ROLE_NAME='"$ORG_ROLE_NAME"',
-REPORT_BUCKET='"$BUCKET"',
-REPORT_PREFIX='"$REPORT_PREFIX"',
-SNS_TOPIC_ARN='"$SNS_TOPIC_ARN"',
-PRESIGN_TTL_SEC='"$PRESIGN_TTL_SEC"',
-ALLOWED_ACCOUNT_IDS='"$ALLOWED_ACCOUNT_IDS"'
-}' \
+  --environment file://env.json \
   --timeout 900 \
   --memory-size 512 \
   --region "$REGION"
+
+
+✅ This is the recommended DevOps way — stable, readable, and reproducible in CI/CD.
+
+🧪 Verify it worked
+
+Check the environment variables set in AWS:
+
+aws lambda get-function-configuration \
+  --function-name "$FUNC_NAME" \
+  --region "$REGION" \
+  --query 'Environment.Variables' --output table
