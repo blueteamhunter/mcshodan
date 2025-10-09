@@ -1,13 +1,5 @@
 # lambda_function.py
 # Runtime: Python 3.11
-#
-# Required ENV VARS:
-#   ORG_ROLE_NAME     = OrgRoute53ReadRole
-#   REPORT_BUCKET     = org-dns-reports-123456789012
-#   REPORT_PREFIX     = route53/monthly/
-#   SNS_TOPIC_ARN     = arn:aws:sns:<region>:<acct>:route53-monthly-dns-report
-# Optional:
-#   PRESIGN_TTL_SEC   = 604800  # 7 days default
 
 import os
 import io
@@ -21,15 +13,16 @@ from datetime import datetime, timezone
 import boto3
 import botocore
 
-# ---------- Config ----------
-ORG_ROLE_NAME   = os.environ["ORG_ROLE_NAME"]
-REPORT_BUCKET   = os.environ["REPORT_BUCKET"]
-REPORT_PREFIX   = os.environ.get("REPORT_PREFIX", "route53/monthly/")
-SNS_TOPIC_ARN   = os.environ["SNS_TOPIC_ARN"]
-PRESIGN_TTL_SEC = int(os.environ.get("PRESIGN_TTL_SEC", "604800"))  # 7 days default
+# ---------- Env / Config ----------
+ORG_ROLE_NAME       = os.environ["ORG_ROLE_NAME"]                   # Role name in member accounts
+REPORT_BUCKET       = os.environ["REPORT_BUCKET"]                   # S3 bucket for CSVs
+REPORT_PREFIX       = os.environ.get("REPORT_PREFIX", "r/")         # S3 "folder" prefix (must end with '/')
+SNS_TOPIC_ARN       = os.environ["SNS_TOPIC_ARN"]                   # SNS topic to email summary + link
+PRESIGN_TTL_SEC     = int(os.environ.get("PRESIGN_TTL_SEC", "604800"))  # 7d default
+FORCE_ALLOWED_ONLY  = os.environ.get("FORCE_ALLOWED_ONLY", "true").lower() == "true"
+ALLOWED_ACCOUNT_IDS = [a.strip() for a in os.environ.get("ALLOWED_ACCOUNT_IDS", "").split(",") if a.strip()]
 
-# AWS clients (reused across invocations)
-ORG = boto3.client("organizations")
+# AWS Clients (created outside handler for reuse)
 STS = boto3.client("sts")
 S3  = boto3.client("s3")
 SNS = boto3.client("sns")
@@ -59,7 +52,7 @@ def _backoff_call(fn, *args, **kwargs):
             raise
 
 def assume_r53_client(account_id: str):
-    """Assume the cross-account Route53 read role and return a Route53 client."""
+    """Assume the cross-account Route53 read role in the target account and return a Route53 client."""
     resp = STS.assume_role(
         RoleArn=f"arn:aws:iam::{account_id}:role/{ORG_ROLE_NAME}",
         RoleSessionName=f"r53Export-{int(time.time())}"
@@ -72,10 +65,26 @@ def assume_r53_client(account_id: str):
         aws_session_token=c["SessionToken"]
     )
 
-def list_all_accounts() -> List[Dict]:
-    """Return all ACTIVE accounts in the Organization."""
-    out = []
-    token = None
+def get_target_accounts() -> List[Dict]:
+    """
+    Returns a list of dicts [{Id:<acctId>, Name:<label>}].
+    If ALLOWED_ACCOUNT_IDS is set, only those accounts are used (Name=Id).
+    If ALLOWED_ACCOUNT_IDS is empty and FORCE_ALLOWED_ONLY is true, fail fast.
+    Otherwise (FORCE_ALLOWED_ONLY=false), fall back to Organizations enumeration.
+    """
+    if ALLOWED_ACCOUNT_IDS:
+        logger.info("Using ALLOWED_ACCOUNT_IDS: %s", ",".join(ALLOWED_ACCOUNT_IDS))
+        return [{"Id": aid, "Name": aid} for aid in ALLOWED_ACCOUNT_IDS]
+
+    if FORCE_ALLOWED_ONLY:
+        raise RuntimeError(
+            "ALLOWED_ACCOUNT_IDS is empty and FORCE_ALLOWED_ONLY=true. "
+            "Set ALLOWED_ACCOUNT_IDS to a comma-separated list of account IDs."
+        )
+
+    # Fallback: use AWS Organizations (requires organizations:ListAccounts permission)
+    ORG = boto3.client("organizations")
+    out, token = [], None
     while True:
         kwargs = {}
         if token:
@@ -178,12 +187,13 @@ def collect_account_rows(account_id: str, account_name: str) -> Tuple[List[Dict]
 
 # ---------- Handler ----------
 def lambda_handler(event, context):
+    # Date stamp in UTC for folder
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prefix = _normalize_prefix(REPORT_PREFIX)
 
-    # 1) List org accounts
-    accounts = list_all_accounts()
-    logger.info("Found %d active accounts", len(accounts))
+    # 1) Target accounts
+    accounts = get_target_accounts()
+    logger.info("Targeting %d account(s): %s", len(accounts), ",".join(a["Id"] for a in accounts))
 
     master_rows: List[Dict] = []
     summaries: List[Tuple[str, str, int, int]] = []
@@ -191,29 +201,32 @@ def lambda_handler(event, context):
     # 2) Per-account export
     for acc in accounts:
         acc_id = acc["Id"]
-        acc_name = acc["Name"]
+        acc_name = acc.get("Name", acc_id)  # if allowlist, Name is the ID by default
         try:
             rows, zc, rc = collect_account_rows(acc_id, acc_name)
 
-            # Write per-account CSV to S3
+            # Per-account CSV
             acc_key = f"{prefix}{stamp}/route53_{acc_name}_{acc_id}.csv"
             s3_put(acc_key, rows_to_csv_bytes(rows))
 
-            # Aggregate for master CSV + summary
             master_rows.extend(rows)
             summaries.append((acc_name, acc_id, zc, rc))
         except Exception as e:
             logger.warning("Account %s (%s) failed: %s", acc_name, acc_id, e)
             summaries.append((acc_name, acc_id, -1, -1))
 
-    # 3) Master CSV with short key + pre-signed URL
-    #    Use a short object key to reduce URL length and minimize email wrapping issues.
+    # 3) Master CSV (short key) + presigned URL
     date_prefix = f"{prefix}{stamp}/"
     master_key  = f"{date_prefix}ALL.csv"
+    if not master_key.strip():
+        raise RuntimeError("master_key resolved empty; check REPORT_PREFIX and stamp")
+
     s3_put(master_key, rows_to_csv_bytes(master_rows))
     master_link = s3_presign(master_key)
+    logger.info("Master key: %s", master_key)
+    logger.info("Presigned URL length: %d", len(master_link))
 
-    # 4) Minimal SNS message with angle-bracketed link (to avoid client URL wrapping)
+    # 4) SNS message (minimal; link in angle brackets to avoid wrapping)
     lines = [
         f"Route 53 Monthly Export — {stamp}",
         "",
@@ -221,11 +234,10 @@ def lambda_handler(event, context):
     ]
     for name, aid, zc, rc in summaries:
         lines.append(f"- {name}, {aid}, {zc}, {rc}")
-
     lines += [
         "",
         "Master CSV link (valid for 7 days):",
-        f"<{master_link}>",  # angle brackets help many clients avoid breaking the URL
+        f"<{master_link}>",
         "",
         "If the link looks broken, copy EVERYTHING between the angle brackets on the line above."
     ]
