@@ -1,44 +1,55 @@
-1) Make sure your basics are set
-echo "$REGION" "$ACCOUNT_ID" "$TOPIC_NAME"
-aws sts get-caller-identity
+🧩 Step 1 — Verify your environment variables
+
+These must still be in your shell from before. Check:
+
+echo $FUNC_NAME $REGION $ACCOUNT_ID $ROLE_NAME $BUCKET $REPORT_PREFIX $SNS_TOPIC_ARN $ORG_ROLE_NAME
 
 
-If TOPIC_NAME isn’t set yet:
+If any are empty, re-export them (replace with your real values):
 
-export TOPIC_NAME="route53-monthly-dns-report"
+export REGION="us-east-1"
+export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export FUNC_NAME="route53-monthly-export"
+export ROLE_NAME="route53-monthly-export-role"
+export BUCKET="org-dns-reports-$ACCOUNT_ID"
+export REPORT_PREFIX="route53/monthly/"
+export ORG_ROLE_NAME="OrgRoute53ReadRole"
+export SNS_TOPIC_ARN="arn:aws:sns:$REGION:$ACCOUNT_ID:route53-monthly-dns-report"
+export PRESIGN_TTL_SEC="604800"
 
-2) Get (or create) the topic ARN and export it
+🧱 Step 2 — Zip the new code
 
-This is idempotent: if the topic exists, it returns the ARN; if not, it creates it and returns the ARN.
+In the same folder as lambda_function.py:
 
-export TOPIC_ARN=$(aws sns create-topic \
-  --name "$TOPIC_NAME" \
-  --region "$REGION" \
-  --query TopicArn --output text)
-
-echo "TOPIC_ARN=$TOPIC_ARN"
-
-
-If that prints (None) or empty:
-
-Double-check region: echo "$REGION"
-
-Ensure your CLI identity is the audit account you expect.
-
-3) (Optional) Verify subscribers (must be Confirmed)
-aws sns list-subscriptions-by-topic \
-  --topic-arn "$TOPIC_ARN" --region "$REGION" \
-  --query 'Subscriptions[].{Endpoint:Endpoint,Protocol:Protocol,Arn:SubscriptionArn}' \
-  --output table
+rm -f function.zip
+zip -r function.zip lambda_function.py
 
 
-If you need to add subscribers:
+✅ You should see:
 
-aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol email --notification-endpoint it-team@yourco.com --region "$REGION"
+  adding: lambda_function.py (deflated 70%)
 
-4) Update the Lambda’s environment with the fixed ARN
+🚀 Step 3 — Update the Lambda function code
 
-You can re-set all env vars you already exported (simplest & safe):
+If the Lambda already exists:
+
+aws lambda update-function-code \
+  --function-name "$FUNC_NAME" \
+  --zip-file fileb://function.zip \
+  --region "$REGION"
+
+
+You should see:
+
+{
+    "FunctionName": "route53-monthly-export",
+    "LastModified": "2025-10-09T22:12:33.123+0000",
+    ...
+}
+
+⚙️ Step 4 — Update Lambda environment variables (just to be safe)
+
+This ensures your new code has all the correct env vars.
 
 aws lambda update-function-configuration \
   --function-name "$FUNC_NAME" \
@@ -46,23 +57,16 @@ aws lambda update-function-configuration \
 ORG_ROLE_NAME=$ORG_ROLE_NAME,\
 REPORT_BUCKET=$BUCKET,\
 REPORT_PREFIX=$REPORT_PREFIX,\
-SNS_TOPIC_ARN=$TOPIC_ARN,\
+SNS_TOPIC_ARN=$SNS_TOPIC_ARN,\
 PRESIGN_TTL_SEC=$PRESIGN_TTL_SEC}" \
   --timeout 900 \
   --memory-size 512 \
   --region "$REGION"
 
-5) Sanity test: publish to SNS
-aws sns publish \
-  --topic-arn "$TOPIC_ARN" \
-  --subject "Route53 report test" \
-  --message "This is a test from CLI." \
-  --region "$REGION"
 
+Wait 10–20 seconds for AWS to apply the new configuration.
 
-Recipients should get a test email (if confirmed).
-
-6) Invoke the Lambda again
+🧪 Step 5 — Invoke and test the Lambda
 aws lambda invoke \
   --function-name "$FUNC_NAME" \
   --payload '{}' \
@@ -70,10 +74,61 @@ aws lambda invoke \
   out.json && cat out.json
 
 
-Then check your email for the SNS message with the pre-signed link, and list the S3 folder for today:
+✅ Expected:
 
+{
+  "accountsProcessed": 3,
+  "rowsInMaster": 274,
+  "masterKey": "route53/monthly/2025-10-09/ALL.csv",
+  "presignedUrlTTLSeconds": 604800
+}
+
+📜 Step 6 — Tail logs to confirm clean execution
+aws logs tail "/aws/lambda/$FUNC_NAME" --follow --since 15m --region "$REGION"
+
+
+You should see lines like:
+
+Found 3 active accounts
+Account workload-dev (111111111111): zones=5 records=47
+Account workload-prod (222222222222): zones=8 records=113
+Done: {"accountsProcessed": 3, "rowsInMaster": 274, "masterKey": "route53/monthly/2025-10-09/ALL.csv"}
+
+📬 Step 7 — Verify email
+
+You’ll receive a clean SNS email that looks like this:
+
+Route 53 Monthly Export — 2025-10-09
+
+Summary (Account, Id, Zones, Records):
+- workload-dev, 111111111111, 5, 47
+- workload-prod, 222222222222, 8, 113
+
+Master CSV link (valid for 7 days):
+<https://org-dns-reports-123456789012.s3.amazonaws.com/route53/monthly/2025-10-09/ALL.csv?...signature...>
+
+If the link looks broken, copy EVERYTHING between the angle brackets on the line above.
+
+
+If you copy the link between the brackets and paste it into a browser, ✅ it should immediately download your ALL.csv.
+
+🧰 Step 8 — (Optional) Confirm the file exists on S3
 TODAY_UTC=$(date -u +%F)
 aws s3 ls "s3://$BUCKET/$REPORT_PREFIX$TODAY_UTC/" --region "$REGION"
 
 
-If TOPIC_ARN is still not populating, tell me what echo "$TOPIC_ARN" prints and any error from the create-topic command, and I’ll pinpoint the fix.
+You should see:
+
+2025-10-09  20:22:15     123456 route53_dev_111111111111.csv
+2025-10-09  20:22:16     543210 route53_prod_222222222222.csv
+2025-10-09  20:22:16     789012 ALL.csv
+
+✅ At this point
+
+You have:
+
+New patched Lambda deployed
+
+S3 bucket populated with CSVs
+
+SNS email with a clean presigned URL that should work perfectl
