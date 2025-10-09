@@ -1,78 +1,51 @@
-Awesome — let’s take your working test Lambda and turn it into a production job that:
+CLI from PowerShell. I’ll assume:
 
-writes the Route53 CSVs to a private S3 bucket,
+You’ll run this in your audit/central account.
 
-generates time-limited pre-signed URLs,
+The cross-account role OrgRoute53ReadRole already exists in each member account (as we designed earlier) with Route53 read permissions.
 
-and sends a short email via SNS containing those links (no SES).
+You’re not using SES (we’ll use SNS email + S3 pre-signed link).
 
-Below is a clean, practical rollout plan you can follow end-to-end. I’ll give you the minimal code changes from your test Lambda plus the AWS steps to deploy and schedule it.
+Region: replace us-east-1 with yours where needed.
 
-0) What you already have
+0) Prepare local files
 
-A Python Lambda that enumerates Org accounts, assumes a read role, exports Route 53 zones/records, and wrote output locally (when you ran it on your terminal). Great!
+Save your Lambda code as lambda_function.py in a clean folder (only this file).
 
-We’ll adapt it to:
+# In the folder containing lambda_function.py
+Compress-Archive -Path .\lambda_function.py -DestinationPath .\function.zip -Force
 
-upload CSVs to S3,
+1) Create a private S3 bucket for reports (one-time)
+$Bucket="org-dns-reports-<ACCOUNT_ID>"  # pick a unique name
+$Region="us-east-1"
 
-pre-sign the “master” CSV (and optionally per-account CSVs),
+aws s3api create-bucket --bucket $Bucket --region $Region `
+  --create-bucket-configuration LocationConstraint=$Region
 
-publish a short message to SNS with those links.
+# Versioning (optional but recommended)
+aws s3api put-bucket-versioning --bucket $Bucket --versioning-configuration Status=Enabled
 
-1) Create the S3 reports bucket (private)
-
-Pick a bucket name, e.g. org-dns-reports-<youracctid>.
-
-aws s3api create-bucket --bucket org-dns-reports-123456789012 --region us-east-1
-aws s3api put-bucket-versioning --bucket org-dns-reports-123456789012 --versioning-configuration Status=Enabled
-# (optional) default encryption
-aws s3api put-bucket-encryption --bucket org-dns-reports-123456789012 --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-
-
-Keep Block Public Access = ON (default). We won’t make anything public; we’ll use pre-signed URLs.
-
-2) Create an SNS topic and add email subscribers
-aws sns create-topic --name route53-monthly-dns-report
-# capture the TopicArn from the output into $TOPIC
+# Default encryption at rest (SSE-S3)
+aws s3api put-bucket-encryption --bucket $Bucket `
+  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 
 
-Subscribe recipients (each must confirm the email they receive from SNS):
+Make sure Block Public Access is ON (default). We won’t open this bucket.
 
-aws sns subscribe --topic-arn $TOPIC --protocol email --notification-endpoint it-team@yourco.com
-aws sns subscribe --topic-arn $TOPIC --protocol email --notification-endpoint secops@yourco.com
+2) Create SNS topic + subscribe recipients (one-time)
+$TopicArn = (aws sns create-topic --name route53-monthly-dns-report --region $Region `
+  --query TopicArn --output text)
 
-Lock the topic to your Lambda role (only your Lambda may publish)
-
-When you create the Lambda role in the next step, update the topic access policy like:
-
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "AllowLambdaToPublish",
-    "Effect": "Allow",
-    "Principal": { "AWS": "arn:aws:iam::<AUDIT_ACCOUNT_ID>:role/<LambdaRoleName>" },
-    "Action": "SNS:Publish",
-    "Resource": "arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report"
-  }]
-}
+# Add email subscribers (each will get a confirmation email)
+aws sns subscribe --topic-arn $TopicArn --protocol email --notification-endpoint it-team@yourco.com --region $Region
+aws sns subscribe --topic-arn $TopicArn --protocol email --notification-endpoint secops@yourco.com --region $Region
 
 
-You can set this in Console → SNS → Topic → Access policy, or via set-topic-attributes.
+Leave the topic policy default for now; we’ll allow the Lambda to publish in the Lambda role policy.
 
-3) Create the Lambda execution IAM role (audit account)
-
-This role needs:
-
-List Org accounts
-
-Assume the member-account read role
-
-Put/Get/List on your reports bucket (optionally only a prefix)
-
-Publish to SNS
-
-Trust policy (Lambda service)
+3) Create the Lambda execution role (one-time)
+3a) Trust policy (Lambda service)
+$Trust = @"
 {
   "Version": "2012-10-17",
   "Statement": [{
@@ -81,8 +54,16 @@ Trust policy (Lambda service)
     "Action": "sts:AssumeRole"
   }]
 }
+"@
+$RoleName="route53-monthly-export-role"
 
-Permissions policy (tighten ARNs for prod)
+aws iam create-role --role-name $RoleName --assume-role-policy-document "$Trust"
+
+3b) Permissions policy (least privilege)
+
+Replace bucket name and region; keep the OrgRoute53ReadRole name (or change to yours).
+
+$PolicyDoc = @"
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -92,225 +73,128 @@ Permissions policy (tighten ARNs for prod)
       "Effect": "Allow",
       "Action": ["s3:PutObject","s3:GetObject","s3:ListBucket"],
       "Resource": [
-        "arn:aws:s3:::org-dns-reports-123456789012",
-        "arn:aws:s3:::org-dns-reports-123456789012/*"
+        "arn:aws:s3:::$Bucket",
+        "arn:aws:s3:::$Bucket/*"
       ]
     },
-    { "Effect": "Allow", "Action": ["sns:Publish"], "Resource": "arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report" },
+    { "Effect": "Allow", "Action": ["sns:Publish"], "Resource": "$TopicArn" },
     { "Effect": "Allow", "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"], "Resource": "*" }
   ]
 }
+"@
+
+aws iam put-role-policy --role-name $RoleName --policy-name route53-monthly-export-inline --policy-document "$PolicyDoc"
+
+4) Create the Lambda function
+$FuncName="route53-monthly-export"
+$OrgRoleName="OrgRoute53ReadRole"               # role in member accounts
+$ReportPrefix="route53/monthly/"
+
+aws lambda create-function `
+  --function-name $FuncName `
+  --zip-file fileb://function.zip `
+  --handler lambda_function.lambda_handler `
+  --runtime python3.11 `
+  --role arn:aws:iam::<ACCOUNT_ID>:role/$RoleName `
+  --environment "Variables={ORG_ROLE_NAME=$OrgRoleName,REPORT_BUCKET=$Bucket,REPORT_PREFIX=$ReportPrefix,SNS_TOPIC_ARN=$TopicArn,PRESIGN_TTL_SEC=604800}" `
+  --timeout 900 `
+  --memory-size 512 `
+  --region $Region
 
 
-(Replace bucket name, account IDs, and region.)
+timeout 900s gives headroom for many accounts/records. Adjust memory if needed.
 
-4) Minimal code changes (Lambda) to use S3 + SNS
+Updating later?
 
-Below is a drop-in pattern for your Lambda to:
+Compress-Archive -Path .\lambda_function.py -DestinationPath .\function.zip -Force
+aws lambda update-function-code --function-name $FuncName --zip-file fileb://function.zip --region $Region
 
-upload CSVs to S3,
-
-create pre-signed link(s),
-
-publish to SNS (no SES).
-
-You only need to adapt the parts where your test code wrote files locally or printed output.
-
-import boto3, os, io, csv, time
-from datetime import datetime, timezone
-
-ORG_ROLE_NAME = os.environ["ORG_ROLE_NAME"]                 # e.g., OrgRoute53ReadRole
-REPORT_BUCKET = os.environ["REPORT_BUCKET"]                 # e.g., org-dns-reports-123456789012
-REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "route53/monthly/")
-SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]                 # arn:aws:sns:region:acct:route53-monthly-dns-report
-
-ORG = boto3.client("organizations")
-STS = boto3.client("sts")
-S3  = boto3.client("s3")
-SNS = boto3.client("sns")
-
-def assume_role(account_id: str):
-    resp = STS.assume_role(
-        RoleArn=f"arn:aws:iam::{account_id}:role/{ORG_ROLE_NAME}",
-        RoleSessionName=f"r53Export-{int(time.time())}"
-    )
-    c = resp["Credentials"]
-    return boto3.client(
-        "route53",
-        aws_access_key_id=c["AccessKeyId"],
-        aws_secret_access_key=c["SecretAccessKey"],
-        aws_session_token=c["SessionToken"]
-    )
-
-def rows_to_csv_bytes(rows):
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["AccountId","ZoneId","ZoneName","PrivateZone","RecordName","Type","TTL","Values"])
-    writer.writeheader()
-    writer.writerows(rows)
-    return buf.getvalue().encode("utf-8")
-
-def put_s3(key: str, body: bytes):
-    S3.put_object(Bucket=REPORT_BUCKET, Key=key, Body=body)
-
-def presign(key: str, seconds=7*24*3600) -> str:
-    return S3.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": REPORT_BUCKET, "Key": key},
-        ExpiresIn=seconds
-    )
-
-def publish_sns(subject: str, message: str):
-    SNS.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
-
-def lambda_handler(event, context):
-    # 1) enumerate accounts
-    accounts = []
-    nt = None
-    while True:
-        kwargs = {}
-        if nt: kwargs["NextToken"] = nt
-        resp = ORG.list_accounts(**kwargs)
-        accounts.extend(a for a in resp["Accounts"] if a["Status"] == "ACTIVE")
-        nt = resp.get("NextToken")
-        if not nt: break
-
-    # 2) collect Route53 data and write per-account CSV to S3
-    master_rows = []
-    summaries = []
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    for acc in accounts:
-        acc_id, acc_name = acc["Id"], acc["Name"]
-        try:
-            r53 = assume_role(acc_id)
-            # list zones
-            zones, marker = [], None
-            while True:
-                kwargs = {}
-                if marker: kwargs["Marker"] = marker
-                z = r53.list_hosted_zones(**kwargs)
-                zones.extend(z.get("HostedZones", []))
-                if z.get("IsTruncated"):
-                    marker = z.get("NextMarker")
-                else:
-                    break
-
-            # list records per zone
-            rows = []
-            rec_total = 0
-            for z in zones:
-                zone_id = z["Id"].split("/")[-1]
-                start_name = start_type = None
-                while True:
-                    rr_kwargs = {"HostedZoneId": z["Id"], "MaxItems": "1000"}
-                    if start_name: rr_kwargs["StartRecordName"] = start_name
-                    if start_type: rr_kwargs["StartRecordType"] = start_type
-                    rr = r53.list_resource_record_sets(**rr_kwargs)
-                    rrs = rr.get("ResourceRecordSets", [])
-                    rec_total += len(rrs)
-                    for r in rrs:
-                        values = ""
-                        if "ResourceRecords" in r:
-                            values = ";".join(v["Value"] for v in r["ResourceRecords"])
-                        elif "AliasTarget" in r:
-                            values = f"ALIAS->{r['AliasTarget'].get('DNSName')}"
-                        rows.append({
-                            "AccountId": acc_id,
-                            "ZoneId": zone_id,
-                            "ZoneName": z["Name"],
-                            "PrivateZone": z.get("Config", {}).get("PrivateZone", False),
-                            "RecordName": r.get("Name",""),
-                            "Type": r.get("Type",""),
-                            "TTL": r.get("TTL",""),
-                            "Values": values
-                        })
-                    if rr.get("IsTruncated"):
-                        start_name = rr.get("NextRecordName")
-                        start_type = rr.get("NextRecordType")
-                    else:
-                        break
-
-            # write per-account csv to S3
-            csv_bytes = rows_to_csv_bytes(rows)
-            acc_key = f"{REPORT_PREFIX}{stamp}/route53_{acc_name}_{acc_id}.csv"
-            put_s3(acc_key, csv_bytes)
-
-            # aggregate
-            master_rows.extend(rows)
-            summaries.append((acc_name, acc_id, len(zones), rec_total))
-
-        except Exception as e:
-            summaries.append((acc_name, acc_id, -1, -1))
-            print(f"[WARN] {acc_name} ({acc_id}) failed: {e}")
-
-    # 3) master CSV in S3 + pre-signed URL
-    master_key = f"{REPORT_PREFIX}{stamp}/route53_ALL_{stamp}.csv"
-    put_s3(master_key, rows_to_csv_bytes(master_rows))
-    master_link = presign(master_key)  # expires in 7 days
-
-    # 4) publish to SNS (short message + link)
-    lines = [f"Route 53 Monthly Export — {stamp}", ""]
-    lines.append("AccountName, AccountId, Zones, Records")
-    for n, i, zc, rc in summaries:
-        lines.append(f"{n}, {i}, {zc}, {rc}")
-    lines.append("")
-    lines.append("Master CSV (expires in 7 days):")
-    lines.append(master_link)
-
-    publish_sns(subject=f"[Route53] Monthly DNS Export {stamp}", message="\n".join(lines))
-    return {"accountsProcessed": len(accounts), "masterKey": master_key}
-
-Environment variables for the Lambda
-
-ORG_ROLE_NAME=OrgRoute53ReadRole
-
-REPORT_BUCKET=org-dns-reports-123456789012
-
-REPORT_PREFIX=route53/monthly/
-
-SNS_TOPIC_ARN=arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report
-
-5) Package & deploy the Lambda
-
-If your Lambda only uses boto3/botocore (already available in AWS Lambda), you can deploy the single .py file:
-
-zip function.zip lambda_function.py
-aws lambda create-function \
-  --function-name route53-monthly-export \
-  --zip-file fileb://function.zip \
-  --handler lambda_function.lambda_handler \
-  --runtime python3.11 \
-  --role arn:aws:iam::<AUDIT_ACCOUNT_ID>:role/<LambdaRoleName> \
-  --environment "Variables={ORG_ROLE_NAME=OrgRoute53ReadRole,REPORT_BUCKET=org-dns-reports-123456789012,REPORT_PREFIX=route53/monthly/,SNS_TOPIC_ARN=arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report}"
+5) Test the function (manual)
+aws lambda invoke --function-name $FuncName --payload "{}" out.json --region $Region
+Get-Content .\out.json
 
 
-(Use update-function-code for future edits.)
+Check CloudWatch Logs for the Lambda for warnings/errors:
 
-6) Test
+Missing role in a member account
 
-In Lambda console, Test with {}.
+Throttling
 
-Watch CloudWatch Logs for summary lines and any warnings.
+AccessDenied on S3/SNS/Organizations
 
-SNS subscribers should receive an email with the pre-signed URL.
+The SNS subscribers should receive an email with:
 
-Try the link — it should download the CSV even though the bucket is private.
+Per-account summary
 
-7) Schedule monthly (EventBridge)
-aws events put-rule --name Route53MonthlyExport --schedule-expression "cron(0 8 1 * ? *)"
-aws events put-targets --rule Route53MonthlyExport --targets "Id"="1","Arn"="arn:aws:lambda:<REGION>:<AUDIT_ACCOUNT_ID>:function:route53-monthly-export"
-aws lambda add-permission --function-name route53-monthly-export --statement-id evt-allow --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn arn:aws:events:<REGION>:<AUDIT_ACCOUNT_ID>:rule/Route53MonthlyExport
+Pre-signed URL to the master CSV (valid for 7 days by default)
 
-Security & Ops checklist
+Try the link; it should download even with a private bucket.
 
-S3 private (Block Public Access ON), SSE enabled.
+6) Schedule it monthly (EventBridge)
 
-Lambda role: least privilege (limit S3 to the reports bucket/prefix).
+Run on 1st of the month @ 08:00 UTC:
 
-SNS topic policy only allows your Lambda to publish.
+$RuleName="Route53MonthlyExport"
+aws events put-rule --name $RuleName --schedule-expression "cron(0 8 1 * ? *)" --region $Region
 
-CloudWatch alarm on Lambda errors.
+aws events put-targets --rule $RuleName --targets "Id"="1","Arn"="arn:aws:lambda:$Region:<ACCOUNT_ID>:function:$FuncName"
 
-S3 lifecycle to expire old reports after N months.
+aws lambda add-permission `
+  --function-name $FuncName `
+  --statement-id evt-allow `
+  --action lambda:InvokeFunction `
+  --principal events.amazonaws.com `
+  --source-arn arn:aws:events:$Region:<ACCOUNT_ID>:rule/$RuleName `
+  --region $Region
 
-If you want, I can turn this into a Terraform or CloudFormation package so you can deploy in one shot (IAM role, topic + policy, bucket, Lambda, EventBridge).
+7) Security checklist (important)
+
+S3
+
+Block Public Access = ON
+
+SSE-S3 (or SSE-KMS) enabled
+
+OPTIONAL: Restrict Lambda IAM to the prefix only ("arn:aws:s3:::$Bucket/$ReportPrefix*")
+
+OrgRole in member accounts
+
+route53:ListHostedZones, route53:ListResourceRecordSets only
+
+Trusts your audit account role to assume
+
+SNS
+
+Only your Lambda role needs sns:Publish on the topic
+
+Subscribers are the approved email list (confirmations completed)
+
+Monitoring
+
+Add a CloudWatch Alarm on the Lambda error metric
+
+Consider a DLQ (SQS) for failed async invocations if you trigger via EventBridge with retry
+
+8) Troubleshooting quick hits
+
+SNS emails not arriving
+
+Ensure subscribers confirmed.
+
+If your AWS account is in GovCloud or has email filtering, check that no-reply@sns.amazonaws.com is allowed.
+
+AccessDenied on S3 presigned link
+
+Make sure the object exists (check S3 console) and URL is not expired.
+
+The presign uses Lambda’s credentials to produce a link; the bucket itself stays private.
+
+AccessDenied assuming member role
+
+Confirm the member role name equals $OrgRoleName and its trust policy allows arn:aws:iam::<AUDIT_ACCOUNT_ID>:root or your Lambda role to assume.
+
+Large org / many records
+
+Increase memory (faster network/CPU) and timeout.
+
+You can shard by OU or paginate accounts if needed.
