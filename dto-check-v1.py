@@ -1,13 +1,13 @@
 # lambda_function.py
-# Lambda runtime: Python 3.11
+# Runtime: Python 3.11
 #
 # Required ENV VARS:
-#   ORG_ROLE_NAME   = OrgRoute53ReadRole                # Role existing in each member account
-#   REPORT_BUCKET   = org-dns-reports-123456789012      # Private S3 bucket for CSVs
-#   REPORT_PREFIX   = route53/monthly/                   # S3 prefix/folder (trailing slash OK)
-#   SNS_TOPIC_ARN   = arn:aws:sns:<REGION>:<ACCT>:route53-monthly-dns-report
+#   ORG_ROLE_NAME     = OrgRoute53ReadRole
+#   REPORT_BUCKET     = org-dns-reports-123456789012
+#   REPORT_PREFIX     = route53/monthly/
+#   SNS_TOPIC_ARN     = arn:aws:sns:<region>:<acct>:route53-monthly-dns-report
 # Optional:
-#   PRESIGN_TTL_SEC = 604800  # 7 days default
+#   PRESIGN_TTL_SEC   = 604800  # 7 days default
 
 import os
 import io
@@ -22,13 +22,13 @@ import boto3
 import botocore
 
 # ---------- Config ----------
-ORG_ROLE_NAME = os.environ["ORG_ROLE_NAME"]
-REPORT_BUCKET = os.environ["REPORT_BUCKET"]
-REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "route53/monthly/")
-SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+ORG_ROLE_NAME   = os.environ["ORG_ROLE_NAME"]
+REPORT_BUCKET   = os.environ["REPORT_BUCKET"]
+REPORT_PREFIX   = os.environ.get("REPORT_PREFIX", "route53/monthly/")
+SNS_TOPIC_ARN   = os.environ["SNS_TOPIC_ARN"]
 PRESIGN_TTL_SEC = int(os.environ.get("PRESIGN_TTL_SEC", "604800"))  # 7 days default
 
-# Clients created once (Lambda container reuse)
+# AWS clients (reused across invocations)
 ORG = boto3.client("organizations")
 STS = boto3.client("sts")
 S3  = boto3.client("s3")
@@ -38,8 +38,10 @@ SNS = boto3.client("sns")
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-
 # ---------- Helpers ----------
+def _normalize_prefix(prefix: str) -> str:
+    return prefix if prefix.endswith("/") else prefix + "/"
+
 def _backoff_call(fn, *args, **kwargs):
     """Exponential backoff wrapper for throttling-prone calls."""
     delay = 1.0
@@ -56,7 +58,6 @@ def _backoff_call(fn, *args, **kwargs):
                 continue
             raise
 
-
 def assume_r53_client(account_id: str):
     """Assume the cross-account Route53 read role and return a Route53 client."""
     resp = STS.assume_role(
@@ -70,7 +71,6 @@ def assume_r53_client(account_id: str):
         aws_secret_access_key=c["SecretAccessKey"],
         aws_session_token=c["SessionToken"]
     )
-
 
 def list_all_accounts() -> List[Dict]:
     """Return all ACTIVE accounts in the Organization."""
@@ -87,7 +87,6 @@ def list_all_accounts() -> List[Dict]:
             break
     return out
 
-
 def list_all_hosted_zones(r53) -> List[Dict]:
     zones = []
     marker = None
@@ -102,7 +101,6 @@ def list_all_hosted_zones(r53) -> List[Dict]:
         else:
             break
     return zones
-
 
 def list_all_record_sets(r53, zone_id: str) -> List[Dict]:
     records = []
@@ -124,7 +122,6 @@ def list_all_record_sets(r53, zone_id: str) -> List[Dict]:
             break
     return records
 
-
 def record_to_row(account_id: str, zone: Dict, record: Dict) -> Dict:
     values = ""
     if "ResourceRecords" in record:
@@ -142,7 +139,6 @@ def record_to_row(account_id: str, zone: Dict, record: Dict) -> Dict:
         "Values": values
     }
 
-
 def rows_to_csv_bytes(rows: List[Dict]) -> bytes:
     buf = io.StringIO()
     writer = csv.DictWriter(
@@ -153,10 +149,8 @@ def rows_to_csv_bytes(rows: List[Dict]) -> bytes:
     writer.writerows(rows)
     return buf.getvalue().encode("utf-8")
 
-
 def s3_put(key: str, body: bytes) -> None:
     _backoff_call(S3.put_object, Bucket=REPORT_BUCKET, Key=key, Body=body)
-
 
 def s3_presign(key: str, expires: int = PRESIGN_TTL_SEC) -> str:
     return S3.generate_presigned_url(
@@ -165,10 +159,8 @@ def s3_presign(key: str, expires: int = PRESIGN_TTL_SEC) -> str:
         ExpiresIn=expires
     )
 
-
 def publish_sns(subject: str, message: str) -> None:
     SNS.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
-
 
 def collect_account_rows(account_id: str, account_name: str) -> Tuple[List[Dict], int, int]:
     """Return (rows, zone_count, record_count) for a single account."""
@@ -184,10 +176,10 @@ def collect_account_rows(account_id: str, account_name: str) -> Tuple[List[Dict]
     logger.info("Account %s (%s): zones=%d records=%d", account_name, account_id, zc, rc)
     return rows, zc, rc
 
-
 # ---------- Handler ----------
 def lambda_handler(event, context):
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prefix = _normalize_prefix(REPORT_PREFIX)
 
     # 1) List org accounts
     accounts = list_all_accounts()
@@ -204,7 +196,7 @@ def lambda_handler(event, context):
             rows, zc, rc = collect_account_rows(acc_id, acc_name)
 
             # Write per-account CSV to S3
-            acc_key = f"{REPORT_PREFIX}{stamp}/route53_{acc_name}_{acc_id}.csv"
+            acc_key = f"{prefix}{stamp}/route53_{acc_name}_{acc_id}.csv"
             s3_put(acc_key, rows_to_csv_bytes(rows))
 
             # Aggregate for master CSV + summary
@@ -214,19 +206,29 @@ def lambda_handler(event, context):
             logger.warning("Account %s (%s) failed: %s", acc_name, acc_id, e)
             summaries.append((acc_name, acc_id, -1, -1))
 
-    # 3) Master CSV + pre-signed URL
-    master_key = f"{REPORT_PREFIX}{stamp}/route53_ALL_{stamp}.csv"
+    # 3) Master CSV with short key + pre-signed URL
+    #    Use a short object key to reduce URL length and minimize email wrapping issues.
+    date_prefix = f"{prefix}{stamp}/"
+    master_key  = f"{date_prefix}ALL.csv"
     s3_put(master_key, rows_to_csv_bytes(master_rows))
     master_link = s3_presign(master_key)
 
-    # 4) SNS email message (short + safe: no raw DNS data)
-    lines = [f"Route 53 Monthly Export — {stamp}", ""]
-    lines.append("AccountName, AccountId, Zones, Records")
+    # 4) Minimal SNS message with angle-bracketed link (to avoid client URL wrapping)
+    lines = [
+        f"Route 53 Monthly Export — {stamp}",
+        "",
+        "Summary (Account, Id, Zones, Records):"
+    ]
     for name, aid, zc, rc in summaries:
-        lines.append(f"{name}, {aid}, {zc}, {rc}")
-    lines.append("")
-    lines.append("Master CSV (time-limited link):")
-    lines.append(master_link)
+        lines.append(f"- {name}, {aid}, {zc}, {rc}")
+
+    lines += [
+        "",
+        "Master CSV link (valid for 7 days):",
+        f"<{master_link}>",  # angle brackets help many clients avoid breaking the URL
+        "",
+        "If the link looks broken, copy EVERYTHING between the angle brackets on the line above."
+    ]
     message = "\n".join(lines)
 
     subject = f"[Route53] Monthly DNS Export {stamp}"
