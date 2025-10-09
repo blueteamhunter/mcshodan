@@ -1,7 +1,15 @@
-api_token: YOUR_CLOUDFLARE_API_TOKEN
-zones:
-  - 
-  - 
-  # Add more zone IDs
-threads: 10
-output_csv: dto_check_results.csv
+export ALLOWED_ACCOUNT_IDS="111111111111,222222222222"
+
+aws lambda update-function-configuration \
+  --function-name "$FUNC_NAME" \
+  --environment 'Variables={
+ORG_ROLE_NAME='"$ORG_ROLE_NAME"',
+REPORT_BUCKET='"$BUCKET"',
+REPORT_PREFIX='"$REPORT_PREFIX"',
+SNS_TOPIC_ARN='"$SNS_TOPIC_ARN"',
+PRESIGN_TTL_SEC='"$PRESIGN_TTL_SEC"',
+ALLOWED_ACCOUNT_IDS='"$ALLOWED_ACCOUNT_IDS"'
+}' \
+  --timeout 900 \
+  --memory-size 512 \
+  --region "$REGION"
