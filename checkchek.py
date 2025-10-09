@@ -1,382 +1,316 @@
-awesome — let’s stand up the test Lambda from scratch in Account A, using CLI on your WSL Ubuntu. This version is read-only and doesn’t send email or use S3. It assumes roles into Accounts B & C, lists all hosted zones and all records, and writes one Excel per zone to /tmp. You’ll see a JSON summary on invoke + details in CloudWatch Logs.
+Awesome — let’s take your working test Lambda and turn it into a production job that:
 
-0) Set your region & IDs (shell vars)
-export AWS_REGION=us-east-1          # pick your region for Lambda
-export ACCOUNT_A_ID=111111111111     # tooling account (Lambda lives here)
-export ACCOUNT_B_ID=222222222222     # target
-export ACCOUNT_C_ID=333333333333     # target
+writes the Route53 CSVs to a private S3 bucket,
 
-1) (Recap) Target roles in B & C (if not already done)
+generates time-limited pre-signed URLs,
 
-Create Route53ReadExport role in B and C:
+and sends a short email via SNS containing those links (no SES).
 
-Trust (trusts Account A’s Lambda role; you can fill this later once you know the role ARN)
-For now you can temporarily trust Account A root (easier while bootstrapping), then tighten to the role ARN later:
+Below is a clean, practical rollout plan you can follow end-to-end. I’ll give you the minimal code changes from your test Lambda plus the AWS steps to deploy and schedule it.
+
+0) What you already have
+
+A Python Lambda that enumerates Org accounts, assumes a read role, exports Route 53 zones/records, and wrote output locally (when you ran it on your terminal). Great!
+
+We’ll adapt it to:
+
+upload CSVs to S3,
+
+pre-sign the “master” CSV (and optionally per-account CSVs),
+
+publish a short message to SNS with those links.
+
+1) Create the S3 reports bucket (private)
+
+Pick a bucket name, e.g. org-dns-reports-<youracctid>.
+
+aws s3api create-bucket --bucket org-dns-reports-123456789012 --region us-east-1
+aws s3api put-bucket-versioning --bucket org-dns-reports-123456789012 --versioning-configuration Status=Enabled
+# (optional) default encryption
+aws s3api put-bucket-encryption --bucket org-dns-reports-123456789012 --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+
+Keep Block Public Access = ON (default). We won’t make anything public; we’ll use pre-signed URLs.
+
+2) Create an SNS topic and add email subscribers
+aws sns create-topic --name route53-monthly-dns-report
+# capture the TopicArn from the output into $TOPIC
+
+
+Subscribe recipients (each must confirm the email they receive from SNS):
+
+aws sns subscribe --topic-arn $TOPIC --protocol email --notification-endpoint it-team@yourco.com
+aws sns subscribe --topic-arn $TOPIC --protocol email --notification-endpoint secops@yourco.com
+
+Lock the topic to your Lambda role (only your Lambda may publish)
+
+When you create the Lambda role in the next step, update the topic access policy like:
 
 {
   "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow",
-      "Principal": { "AWS": "arn:aws:iam::111111111111:root" },
-      "Action": "sts:AssumeRole" }
-  ]
+  "Statement": [{
+    "Sid": "AllowLambdaToPublish",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::<AUDIT_ACCOUNT_ID>:role/<LambdaRoleName>" },
+    "Action": "SNS:Publish",
+    "Resource": "arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report"
+  }]
 }
 
 
-Permissions (read-only Route53):
+You can set this in Console → SNS → Topic → Access policy, or via set-topic-attributes.
 
+3) Create the Lambda execution IAM role (audit account)
+
+This role needs:
+
+List Org accounts
+
+Assume the member-account read role
+
+Put/Get/List on your reports bucket (optionally only a prefix)
+
+Publish to SNS
+
+Trust policy (Lambda service)
 {
   "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow",
-      "Action": ["route53:ListHostedZones","route53:ListResourceRecordSets"],
-      "Resource": "*" }
-  ]
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "lambda.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
 }
 
-
-After you create the Lambda role (next step), tighten trust to the role ARN (least privilege). I show that change below.
-
-2) Create the Lambda execution role (Account A)
-2.1 Trust policy (Lambda service)
-
-Save as trust-lambda.json:
-
+Permissions policy (tighten ARNs for prod)
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Sid": "LambdaTrust", "Effect": "Allow",
-      "Principal": { "Service": "lambda.amazonaws.com" },
-      "Action": "sts:AssumeRole" }
-  ]
-}
-
-
-Create role:
-
-aws iam create-role \
-  --role-name r53-exporter-lambda-role \
-  --assume-role-policy-document file://trust-lambda.json
-
-
-Attach basic logs (managed policy):
-
-aws iam attach-role-policy \
-  --role-name r53-exporter-lambda-role \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-
-2.2 Inline permissions (allow AssumeRole into B & C)
-
-Save as lambda-inline-perms.json (replace IDs if needed):
-
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Sid": "AssumeTargets", "Effect": "Allow",
-      "Action": "sts:AssumeRole",
+    { "Effect": "Allow", "Action": ["organizations:ListAccounts"], "Resource": "*" },
+    { "Effect": "Allow", "Action": ["sts:AssumeRole"], "Resource": "arn:aws:iam::*:role/OrgRoute53ReadRole" },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject","s3:GetObject","s3:ListBucket"],
       "Resource": [
-        "arn:aws:iam::222222222222:role/Route53ReadExport",
-        "arn:aws:iam::333333333333:role/Route53ReadExport"
-      ] }
+        "arn:aws:s3:::org-dns-reports-123456789012",
+        "arn:aws:s3:::org-dns-reports-123456789012/*"
+      ]
+    },
+    { "Effect": "Allow", "Action": ["sns:Publish"], "Resource": "arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report" },
+    { "Effect": "Allow", "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"], "Resource": "*" }
   ]
 }
 
 
-Attach:
+(Replace bucket name, account IDs, and region.)
 
-aws iam put-role-policy \
-  --role-name r53-exporter-lambda-role \
-  --policy-name r53-exporter-assume-targets \
-  --policy-document file://lambda-inline-perms.json
+4) Minimal code changes (Lambda) to use S3 + SNS
 
+Below is a drop-in pattern for your Lambda to:
 
-Get the role ARN (you’ll need it to tighten B/C trust later):
+upload CSVs to S3,
 
-aws iam get-role --role-name r53-exporter-lambda-role \
-  --query 'Role.Arn' --output text
+create pre-signed link(s),
 
+publish to SNS (no SES).
 
-Example: arn:aws:iam::111111111111:role/r53-exporter-lambda-role
+You only need to adapt the parts where your test code wrote files locally or printed output.
 
-3) Attach the openpyxl layer
+import boto3, os, io, csv, time
+from datetime import datetime, timezone
 
-(You already built/published the layer in WSL earlier. If not, I can re-send those steps.)
+ORG_ROLE_NAME = os.environ["ORG_ROLE_NAME"]                 # e.g., OrgRoute53ReadRole
+REPORT_BUCKET = os.environ["REPORT_BUCKET"]                 # e.g., org-dns-reports-123456789012
+REPORT_PREFIX = os.environ.get("REPORT_PREFIX", "route53/monthly/")
+SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]                 # arn:aws:sns:region:acct:route53-monthly-dns-report
 
-Grab its LayerVersionArn, e.g.:
+ORG = boto3.client("organizations")
+STS = boto3.client("sts")
+S3  = boto3.client("s3")
+SNS = boto3.client("sns")
 
-arn:aws:lambda:us-east-1:111111111111:layer:openpyxl-3_1_5:1
-
-4) Create the function package
-
-Create a working folder and drop in the test Lambda:
-
-mkdir -p ~/lambda/route53-exporter-test && cd ~/lambda/route53-exporter-test
-
-
-Create lambda_function.py with this read-only test code:
-
-import os, time, datetime, logging, re
-import boto3
-from botocore.config import Config
-from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
-
-log = logging.getLogger()
-log.setLevel(logging.INFO)
-
-ROUTE53_REGION = "us-east-1"
-TMP_DIR = "/tmp"
-
-def _env(name, default=None, required=False):
-    v = os.environ.get(name, default)
-    if required and (v is None or v == ""):
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
-
-def assume_session(role_arn: str, session_name: str, duration=3600) -> boto3.Session:
-    sts = boto3.client("sts")
-    kwargs = {"RoleArn": role_arn, "RoleSessionName": session_name, "DurationSeconds": duration}
-    external_id = os.environ.get("EXTERNAL_ID")
-    if external_id:
-        kwargs["ExternalId"] = external_id
-    creds = sts.assume_role(**kwargs)["Credentials"]
-    return boto3.Session(
-        aws_access_key_id=creds["AccessKeyId"],
-        aws_secret_access_key=creds["SecretAccessKey"],
-        aws_session_token=creds["SessionToken"],
+def assume_role(account_id: str):
+    resp = STS.assume_role(
+        RoleArn=f"arn:aws:iam::{account_id}:role/{ORG_ROLE_NAME}",
+        RoleSessionName=f"r53Export-{int(time.time())}"
+    )
+    c = resp["Credentials"]
+    return boto3.client(
+        "route53",
+        aws_access_key_id=c["AccessKeyId"],
+        aws_secret_access_key=c["SecretAccessKey"],
+        aws_session_token=c["SessionToken"]
     )
 
-def list_all_zones(r53_client):
-    zones, marker = [], None
-    while True:
-        resp = r53_client.list_hosted_zones(Marker=marker) if marker else r53_client.list_hosted_zones()
-        zones.extend(resp.get("HostedZones", []))
-        if resp.get("IsTruncated"):
-            marker = resp.get("NextMarker")
-        else:
-            break
-    return zones
+def rows_to_csv_bytes(rows):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["AccountId","ZoneId","ZoneName","PrivateZone","RecordName","Type","TTL","Values"])
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
 
-def list_all_records(r53_client, zone_id):
-    recs, params = [], {"HostedZoneId": zone_id}
-    while True:
-        resp = r53_client.list_resource_record_sets(**params)
-        recs.extend(resp.get("ResourceRecordSets", []))
-        if resp.get("IsTruncated"):
-            params["StartRecordName"] = resp["NextRecordName"]
-            params["StartRecordType"] = resp["NextRecordType"]
-            if "NextRecordIdentifier" in resp:
-                params["StartRecordIdentifier"] = resp["NextRecordIdentifier"]
-        else:
-            break
-    return recs
+def put_s3(key: str, body: bytes):
+    S3.put_object(Bucket=REPORT_BUCKET, Key=key, Body=body)
 
-def sanitize_sheet_name(name: str) -> str:
-    name = re.sub(r'[:\\/\?\*\[\]]', '-', name)
-    return name[:31] if len(name) > 31 else name
+def presign(key: str, seconds=7*24*3600) -> str:
+    return S3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": REPORT_BUCKET, "Key": key},
+        ExpiresIn=seconds
+    )
 
-def sanitize_filename(name: str, maxlen=120) -> str:
-    return re.sub(r'[^A-Za-z0-9._-]+', '_', name)[:maxlen]
-
-def write_zone_workbook(account_id: str, zone_name: str, zone_id: str, records: list) -> str:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = sanitize_sheet_name(zone_name or zone_id)
-
-    headers = [
-        "ZoneName","ZoneId","RecordName","Type","TTL","Values",
-        "AliasDNSName","AliasHostedZoneId","EvaluateTargetHealth",
-        "SetIdentifier","Weight","Failover","Region","MultiValueAnswer"
-    ]
-    ws.append(headers)
-
-    for rr in records:
-        name = rr.get("Name","")
-        rtype = rr.get("Type","")
-        ttl = rr.get("TTL","")
-        values = "\n".join([v.get("Value","") for v in rr.get("ResourceRecords", [])])
-        alias = rr.get("AliasTarget", {})
-        row = [
-            zone_name, zone_id, name, rtype, ttl, values,
-            alias.get("DNSName",""), alias.get("HostedZoneId",""), alias.get("EvaluateTargetHealth",""),
-            rr.get("SetIdentifier",""), rr.get("Weight",""), rr.get("Failover",""),
-            rr.get("Region",""), rr.get("MultiValueAnswer","")
-        ]
-        ws.append(row)
-
-    for col_idx, _ in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
-        col_letter = get_column_letter(col_idx)
-        max_len = 0
-        for cell in ws[col_letter]:
-            val = str(cell.value) if cell.value is not None else ""
-            if len(val) > max_len:
-                max_len = len(val)
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
-
-    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    safe_zone = sanitize_filename(zone_name.rstrip(".") if zone_name else zone_id)
-    out_path = f"{TMP_DIR}/route53-{account_id}-{safe_zone}-{ts}.xlsx"
-    wb.save(out_path)
-    return out_path
+def publish_sns(subject: str, message: str):
+    SNS.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
 
 def lambda_handler(event, context):
-    role_arns = [a.strip() for a in _env("TARGET_ROLE_ARNS", required=True).split(",") if a.strip()]
-    write_excel = _env("WRITE_EXCEL", "true").lower() == "true"
-    max_paths = int(_env("MAX_PATHS_IN_OUTPUT", "25"))
-    sample_records_per_zone = int(_env("SAMPLE_RECORDS_PER_ZONE", "3"))
+    # 1) enumerate accounts
+    accounts = []
+    nt = None
+    while True:
+        kwargs = {}
+        if nt: kwargs["NextToken"] = nt
+        resp = ORG.list_accounts(**kwargs)
+        accounts.extend(a for a in resp["Accounts"] if a["Status"] == "ACTIVE")
+        nt = resp.get("NextToken")
+        if not nt: break
 
-    summary = {
-        "run_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ"),
-        "accounts": [],
-        "generated_files": [],
-    }
+    # 2) collect Route53 data and write per-account CSV to S3
+    master_rows = []
+    summaries = []
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    total_zone_count = 0
-    total_record_count = 0
-    all_paths = []
+    for acc in accounts:
+        acc_id, acc_name = acc["Id"], acc["Name"]
+        try:
+            r53 = assume_role(acc_id)
+            # list zones
+            zones, marker = [], None
+            while True:
+                kwargs = {}
+                if marker: kwargs["Marker"] = marker
+                z = r53.list_hosted_zones(**kwargs)
+                zones.extend(z.get("HostedZones", []))
+                if z.get("IsTruncated"):
+                    marker = z.get("NextMarker")
+                else:
+                    break
 
-    for role_arn in role_arns:
-        account_id = role_arn.split(":")[4]
-        log.info(f"[{account_id}] assuming role: {role_arn}")
-        sess = assume_session(role_arn, session_name=f"r53-export-{int(time.time())}")
-        r53 = sess.client("route53", region_name=ROUTE53_REGION,
-                          config=Config(retries={"max_attempts": 10, "mode": "adaptive"}))
+            # list records per zone
+            rows = []
+            rec_total = 0
+            for z in zones:
+                zone_id = z["Id"].split("/")[-1]
+                start_name = start_type = None
+                while True:
+                    rr_kwargs = {"HostedZoneId": z["Id"], "MaxItems": "1000"}
+                    if start_name: rr_kwargs["StartRecordName"] = start_name
+                    if start_type: rr_kwargs["StartRecordType"] = start_type
+                    rr = r53.list_resource_record_sets(**rr_kwargs)
+                    rrs = rr.get("ResourceRecordSets", [])
+                    rec_total += len(rrs)
+                    for r in rrs:
+                        values = ""
+                        if "ResourceRecords" in r:
+                            values = ";".join(v["Value"] for v in r["ResourceRecords"])
+                        elif "AliasTarget" in r:
+                            values = f"ALIAS->{r['AliasTarget'].get('DNSName')}"
+                        rows.append({
+                            "AccountId": acc_id,
+                            "ZoneId": zone_id,
+                            "ZoneName": z["Name"],
+                            "PrivateZone": z.get("Config", {}).get("PrivateZone", False),
+                            "RecordName": r.get("Name",""),
+                            "Type": r.get("Type",""),
+                            "TTL": r.get("TTL",""),
+                            "Values": values
+                        })
+                    if rr.get("IsTruncated"):
+                        start_name = rr.get("NextRecordName")
+                        start_type = rr.get("NextRecordType")
+                    else:
+                        break
 
-        zones = list_all_zones(r53)
-        log.info(f"[{account_id}] hosted zones: {len(zones)}")
+            # write per-account csv to S3
+            csv_bytes = rows_to_csv_bytes(rows)
+            acc_key = f"{REPORT_PREFIX}{stamp}/route53_{acc_name}_{acc_id}.csv"
+            put_s3(acc_key, csv_bytes)
 
-        acct_zone_count = 0
-        acct_record_count = 0
-        acct_detail = {"account_id": account_id, "zones": []}
+            # aggregate
+            master_rows.extend(rows)
+            summaries.append((acc_name, acc_id, len(zones), rec_total))
 
-        for z in zones:
-            zone_id = z["Id"].split("/")[-1]
-            zone_name = z.get("Name", "").rstrip(".")
-            records = list_all_records(r53, zone_id)
+        except Exception as e:
+            summaries.append((acc_name, acc_id, -1, -1))
+            print(f"[WARN] {acc_name} ({acc_id}) failed: {e}")
 
-            acct_zone_count += 1
-            acct_record_count += len(records)
+    # 3) master CSV in S3 + pre-signed URL
+    master_key = f"{REPORT_PREFIX}{stamp}/route53_ALL_{stamp}.csv"
+    put_s3(master_key, rows_to_csv_bytes(master_rows))
+    master_link = presign(master_key)  # expires in 7 days
 
-            path = None
-            if write_excel:
-                path = write_zone_workbook(account_id, zone_name or zone_id, zone_id, records)
-                all_paths.append(path)
-                log.info(f"[{account_id}] wrote {path} ({len(records)} records)")
+    # 4) publish to SNS (short message + link)
+    lines = [f"Route 53 Monthly Export — {stamp}", ""]
+    lines.append("AccountName, AccountId, Zones, Records")
+    for n, i, zc, rc in summaries:
+        lines.append(f"{n}, {i}, {zc}, {rc}")
+    lines.append("")
+    lines.append("Master CSV (expires in 7 days):")
+    lines.append(master_link)
 
-            sample = []
-            for rr in records[:sample_records_per_zone]:
-                sample.append({
-                    "Name": rr.get("Name",""),
-                    "Type": rr.get("Type",""),
-                    "TTL": rr.get("TTL",""),
-                    "ValuesCount": len(rr.get("ResourceRecords", [])),
-                    "Alias": bool(rr.get("AliasTarget"))
-                })
+    publish_sns(subject=f"[Route53] Monthly DNS Export {stamp}", message="\n".join(lines))
+    return {"accountsProcessed": len(accounts), "masterKey": master_key}
 
-            acct_detail["zones"].append({
-                "zone_name": zone_name or zone_id,
-                "zone_id": zone_id,
-                "record_count": len(records),
-                "sample_records": sample,
-                "file_path": path
-            })
+Environment variables for the Lambda
 
-        total_zone_count += acct_zone_count
-        total_record_count += acct_record_count
-        acct_detail["zone_count"] = acct_zone_count
-        acct_detail["total_records"] = acct_record_count
-        summary["accounts"].append(acct_detail)
+ORG_ROLE_NAME=OrgRoute53ReadRole
 
-    summary["totals"] = {"zones": total_zone_count, "records": total_record_count}
-    summary["generated_files"] = all_paths[:max_paths]
-    if len(all_paths) > max_paths:
-        summary["generated_files_omitted"] = len(all_paths) - max_paths
+REPORT_BUCKET=org-dns-reports-123456789012
 
-    return summary
+REPORT_PREFIX=route53/monthly/
 
+SNS_TOPIC_ARN=arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report
 
-Zip it:
+5) Package & deploy the Lambda
 
-zip -j function.zip lambda_function.py
+If your Lambda only uses boto3/botocore (already available in AWS Lambda), you can deploy the single .py file:
 
-5) Create the Lambda function
-
-Get your Lambda role ARN:
-
-LAMBDA_ROLE_ARN=$(aws iam get-role --role-name r53-exporter-lambda-role \
-  --query 'Role.Arn' --output text)
-echo $LAMBDA_ROLE_ARN
-
-
-Create the function:
-
+zip function.zip lambda_function.py
 aws lambda create-function \
-  --function-name route53-exporter-test \
-  --runtime python3.12 \
-  --role "$LAMBDA_ROLE_ARN" \
-  --handler lambda_function.lambda_handler \
+  --function-name route53-monthly-export \
   --zip-file fileb://function.zip \
-  --region $AWS_REGION
+  --handler lambda_function.lambda_handler \
+  --runtime python3.11 \
+  --role arn:aws:iam::<AUDIT_ACCOUNT_ID>:role/<LambdaRoleName> \
+  --environment "Variables={ORG_ROLE_NAME=OrgRoute53ReadRole,REPORT_BUCKET=org-dns-reports-123456789012,REPORT_PREFIX=route53/monthly/,SNS_TOPIC_ARN=arn:aws:sns:<REGION>:<AUDIT_ACCOUNT_ID>:route53-monthly-dns-report}"
 
 
-Attach the openpyxl layer:
+(Use update-function-code for future edits.)
 
-aws lambda update-function-configuration \
-  --function-name route53-exporter-test \
-  --layers arn:aws:lambda:$AWS_REGION:$ACCOUNT_A_ID:layer:openpyxl-3_1_5:1 \
-  --region $AWS_REGION
+6) Test
 
+In Lambda console, Test with {}.
 
-Set environment variables:
+Watch CloudWatch Logs for summary lines and any warnings.
 
-aws lambda update-function-configuration \
-  --function-name route53-exporter-test \
-  --environment "Variables={\
-TARGET_ROLE_ARNS=arn:aws:iam::$ACCOUNT_B_ID:role/Route53ReadExport,arn:aws:iam::$ACCOUNT_C_ID:role/Route53ReadExport,\
-WRITE_EXCEL=true,MAX_PATHS_IN_OUTPUT=25,SAMPLE_RECORDS_PER_ZONE=3}" \
-  --timeout 600 \
-  --memory-size 1024 \
-  --region $AWS_REGION
+SNS subscribers should receive an email with the pre-signed URL.
 
+Try the link — it should download the CSV even though the bucket is private.
 
-(If B/C trust requires ExternalId, add EXTERNAL_ID=your-id above.)
+7) Schedule monthly (EventBridge)
+aws events put-rule --name Route53MonthlyExport --schedule-expression "cron(0 8 1 * ? *)"
+aws events put-targets --rule Route53MonthlyExport --targets "Id"="1","Arn"="arn:aws:lambda:<REGION>:<AUDIT_ACCOUNT_ID>:function:route53-monthly-export"
+aws lambda add-permission --function-name route53-monthly-export --statement-id evt-allow --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn arn:aws:events:<REGION>:<AUDIT_ACCOUNT_ID>:rule/Route53MonthlyExport
 
-6) Tighten B/C trust to the role ARN (least privilege)
+Security & Ops checklist
 
-Now update B and C trust policies to only trust your role:
+S3 private (Block Public Access ON), SSE enabled.
 
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Sid": "TrustAccountARoleOnly", "Effect": "Allow",
-      "Principal": { "AWS": "arn:aws:iam::111111111111:role/r53-exporter-lambda-role" },
-      "Action": "sts:AssumeRole"
-      /* , "Condition": { "StringEquals": { "sts:ExternalId": "YOUR_EXTERNAL_ID" } } */
-    }
-  ]
-}
+Lambda role: least privilege (limit S3 to the reports bucket/prefix).
 
-7) Test invoke & logs
+SNS topic policy only allows your Lambda to publish.
 
-Invoke:
+CloudWatch alarm on Lambda errors.
 
-aws lambda invoke \
-  --function-name route53-exporter-test \
-  --payload '{}' \
-  --cli-binary-format raw-in-base64-out \
-  out.json --region $AWS_REGION && cat out.json | jq
+S3 lifecycle to expire old reports after N months.
 
-
-Tail logs:
-
-aws logs tail "/aws/lambda/route53-exporter-test" --follow --region $AWS_REGION
-
-
-You should see log lines like:
-
-[222222222222] hosted zones: 7
-[222222222222] wrote /tmp/route53-222222222222-example_com-20251007T...Z.xlsx (42 records)
-
-That’s it
-
-Once you’re happy with the output (counts, files written to /tmp), you can switch to the SES version to deliver the per-zone Excel files via email. If you want, I can also generate a one-shot script that runs every command above for you with your real IDs.
+If you want, I can turn this into a Terraform or CloudFormation package so you can deploy in one shot (IAM role, topic + policy, bucket, Lambda, EventBridge).
